@@ -1,0 +1,9 @@
+CALLSHARE HYBRID iOS R1
+
+Base Xcode project, UI, audio engine, and workflow: supplied callshareWIFIHOTSPOTiosbuild.zip.
+BLEManager, CallKitManager, and K7Protocol: supplied IOSCALLSHAREBLECALLKITREADY.zip project source.
+WiFiTransport: supplied CALLSHARE_R2_MTU_SAFE_TEST_MATCHED.zip R2-matched Swift transport.
+
+R1 control plane: BLE GATT only (incoming/answer/hangup/outgoing/DTMF/peer-IP/SMS event).
+R1 audio plane: Wi-Fi UDP J7WV fragmented R2 only.
+Custom opcodes E5/E6/E7 are CALLSHARE-owned extensions for this Android app, not stock K7/SIMPlus commands.
