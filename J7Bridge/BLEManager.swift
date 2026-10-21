@@ -19,7 +19,11 @@ final class BLEManager: NSObject, ObservableObject {
     private var audioTXQueueDrops = 0
     private var audioRXCount = 0
     private var rxValueCount = 0
+    // Control writes (including multipart SMS commands) are serialized because GATT writes use response semantics.
+    private var controlTXQueue: [Data] = []
+    private var controlWriteInFlight = false
 
+    var onLog: ((String) -> Void)?
     var onStatus: ((String) -> Void)?
     var onDevice: ((String?) -> Void)?
     var onControlPayload: ((Data) -> Void)?
@@ -27,13 +31,6 @@ final class BLEManager: NSObject, ObservableObject {
     var onReady: (() -> Void)?
 
     private var readyNotified = false
-
-    // Serialize write-with-response control frames. In particular, VOICE_CLOSE
-    // must complete before HANGUP is sent, so the call-end opcode is not raced
-    // by the preceding audio-gate control write.
-    private var controlTXQueue: [(frame: Data, retries: Int)] = []
-    private var controlWriteInFlight = false
-    private var inFlightControlWrite: (frame: Data, retries: Int)?
 
     var isReady: Bool { peripheral?.state == .connected && txChar != nil && rxNotifyEnabled }
 
@@ -46,7 +43,7 @@ final class BLEManager: NSObject, ObservableObject {
             delegate: self,
             queue: .main,
             options: [
-                CBCentralManagerOptionRestoreIdentifierKey: "com.ugur.callshare.callendlogr1.ble-central.r1",
+                CBCentralManagerOptionRestoreIdentifierKey: "com.ugur.callshare.ble-central.r1",
                 CBCentralManagerOptionShowPowerAlertKey: true
             ]
         )
@@ -97,6 +94,50 @@ final class BLEManager: NSObject, ObservableObject {
     }
     func sendHangup() { sendControl(Data([K7Protocol.cmdHangup])) }
 
+    /// Sends a complete UTF-8 SMS as ordered, bounded app-level BLE control chunks.
+    /// Each encoded K7 control payload stays below the protocol's one-byte length limit.
+    @discardableResult
+    func sendCallshareSMS(to address: String, body: String, id: String) -> Bool {
+        guard readyNotified, peripheral?.state == .connected, txChar != nil else {
+            log("[SMS] TX refused: GATT control channel is not ready")
+            return false
+        }
+        let bytes = Array(body.utf8)
+        guard !address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !bytes.isEmpty, bytes.count <= 16_384 else {
+            log("[SMS] TX rejected: invalid recipient/body length")
+            return false
+        }
+        let chunkSize = 36
+        let count = (bytes.count + chunkSize - 1) / chunkSize
+        var payloads: [Data] = []
+        payloads.reserveCapacity(count)
+        let timestamp = Int64(Date().timeIntervalSince1970 * 1000.0)
+        for index in 0..<count {
+            let start = index * chunkSize
+            let end = min(bytes.count, start + chunkSize)
+            let chunk = Data(bytes[start..<end]).base64EncodedString()
+            let object: [String: Any] = [
+                "v": 1, "kind": "send", "id": id, "to": address,
+                "ts": timestamp, "part": index, "parts": count, "chunk": chunk
+            ]
+            guard let json = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else {
+                log("[SMS] TX JSON encoding failed id=\(id)")
+                return false
+            }
+            let payload = Data([K7Protocol.cmdCallshareSMSSendChunk]) + json
+            guard payload.count <= 255 else {
+                log("[SMS] TX chunk exceeds K7 frame limit id=\(id) bytes=\(payload.count)")
+                return false
+            }
+            payloads.append(payload)
+        }
+        controlTXQueue.append(contentsOf: payloads)
+        log("[SMS] Queued outgoing SMS id=\(id) chunks=\(count) bytes=\(bytes.count)")
+        flushControlTXQueue()
+        return true
+    }
+
     func sendVoiceOpen() {
         sendControl(Data([K7Protocol.evtVoiceOpen]))
         log("[VOICE] OPEN requested")
@@ -108,8 +149,16 @@ final class BLEManager: NSObject, ObservableObject {
         log("[VOICE] CLOSE requested; audio queue cleared")
     }
 
-    func sendMakeCall(number: String, simId: UInt8) {
-        sendControl(K7Protocol.makeCallPayload(number: number, simId: simId))
+    @discardableResult
+    func sendMakeCall(number: String, simId: UInt8) -> Bool {
+        guard readyNotified, peripheral?.state == .connected, txChar != nil else {
+            log("[BLE] MAKE_CALL refused: GATT control channel is not ready")
+            return false
+        }
+        let payload = K7Protocol.makeCallPayload(number: number, simId: simId)
+        sendControl(payload)
+        log("[BLE] MAKE_CALL queued; opcode=02 payloadLength=\(payload.count) sim=\(simId) numberLength=\(number.count)")
+        return true
     }
 
     func sendDTMF(_ value: UInt8) {
@@ -161,28 +210,37 @@ final class BLEManager: NSObject, ObservableObject {
     }
 
     private func sendControl(_ payload: Data) {
-        guard peripheral != nil, txChar != nil else { return }
-        controlTXQueue.append((frame: K7Protocol.wrapControl(payload), retries: 0))
-        flushControlTX()
+        guard let p = peripheral, let tx = txChar, p.state == .connected else {
+            log("[BLE] TX unavailable")
+            return
+        }
+        guard payload.count <= 255 else {
+            log("[BLE] CONTROL TX rejected: payload exceeds one-byte frame length (\(payload.count))")
+            return
+        }
+        if payload.first == K7Protocol.cmdCallshareSMSSendChunk {
+            controlTXQueue.append(payload)
+        } else {
+            // Preserve call-control responsiveness: enqueue ordinary control commands
+            // ahead of pending SMS chunks, but keep already queued control commands FIFO.
+            var insertionIndex = controlWriteInFlight ? min(1, controlTXQueue.count) : 0
+            while insertionIndex < controlTXQueue.count,
+                  controlTXQueue[insertionIndex].first != K7Protocol.cmdCallshareSMSSendChunk {
+                insertionIndex += 1
+            }
+            controlTXQueue.insert(payload, at: insertionIndex)
+        }
+        flushControlTXQueue()
     }
 
-    private func flushControlTX() {
-        guard !controlWriteInFlight,
-              let p = peripheral,
-              p.state == .connected,
-              let tx = txChar,
-              !controlTXQueue.isEmpty else { return }
-
-        let item = controlTXQueue.removeFirst()
-        if tx.properties.contains(.write) {
-            controlWriteInFlight = true
-            inFlightControlWrite = item
-            p.writeValue(item.frame, for: tx, type: .withResponse)
-        } else if tx.properties.contains(.writeWithoutResponse) {
-            // Keep compatibility with peers that expose only no-response writes.
-            p.writeValue(item.frame, for: tx, type: .withoutResponse)
-            DispatchQueue.main.async { [weak self] in self?.flushControlTX() }
-        }
+    private func flushControlTXQueue() {
+        guard !controlWriteInFlight, !controlTXQueue.isEmpty,
+              let p = peripheral, let tx = txChar, p.state == .connected else { return }
+        let payload = controlTXQueue[0]
+        let frame = K7Protocol.wrapControl(payload)
+        controlWriteInFlight = true
+        log("[BLE] CONTROL TX opcode=\(payload.first.map { String(format: "%02X", $0) } ?? "?") queued=\(controlTXQueue.count) bytes=\(payload.count)")
+        p.writeValue(frame, for: tx, type: .withResponse)
     }
 
     private func flushAudioTX() {
@@ -230,7 +288,6 @@ final class BLEManager: NSObject, ObservableObject {
         audioTXQueue.removeAll(keepingCapacity: true)
         controlTXQueue.removeAll(keepingCapacity: true)
         controlWriteInFlight = false
-        inFlightControlWrite = nil
         audioRXCount = 0
         rxValueCount = 0
         audioTXCount = 0
@@ -246,8 +303,7 @@ final class BLEManager: NSObject, ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: item)
     }
 
-    // Release build: diagnostic messages are disabled and constructed lazily.
-    private func log(_ value: @autoclosure () -> String) { }
+    private func log(_ value: String) { onLog?(value) }
 }
 
 extension BLEManager: CBCentralManagerDelegate {
@@ -366,17 +422,15 @@ extension BLEManager: CBPeripheralDelegate {
     }
 
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
-        guard characteristic.uuid == K7Protocol.tx, controlWriteInFlight else { return }
-
-        let completed = inFlightControlWrite
-        controlWriteInFlight = false
-        inFlightControlWrite = nil
-
-        if error != nil, let completed, completed.retries < 1, peripheral.state == .connected {
-            // One bounded retry for transient GATT write failures; no unbounded loop.
-            controlTXQueue.insert((frame: completed.frame, retries: completed.retries + 1), at: 0)
+        guard characteristic.uuid == K7Protocol.tx else { return }
+        if controlWriteInFlight {
+            if let error { log("[BLE] CONTROL TX write ERROR=\(error.localizedDescription)") }
+            if !controlTXQueue.isEmpty { controlTXQueue.removeFirst() }
+            controlWriteInFlight = false
+            flushControlTXQueue()
+        } else if let error {
+            log("[BLE] TX write response ERROR=\(error.localizedDescription)")
         }
-        flushControlTX()
     }
 
     func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
@@ -399,9 +453,20 @@ extension BLEManager: CBPeripheralDelegate {
             return
         }
 
+        // Do not push every 20 ms audio notification into the SwiftUI log.
+        // BLE callbacks run on the main queue in this project, so per-frame UI
+        // logging can starve the very audio path we are trying to service.
+        rxValueCount += 1
+        if rxValueCount <= 3 || rxValueCount % 100 == 0 {
+            NSLog("[J7BRIDGE_DIAG] BLE RX 5CB8 value #\(rxValueCount) len=\(data.count) HEX=\(K7Protocol.hex(data))")
+        }
+
         for parsed in rxParser.feed(data) {
             if parsed.channel == 3 {
                 audioRXCount += 1
+                if audioRXCount == 1 || audioRXCount % 25 == 0 {
+                    NSLog("[J7BRIDGE_DIAG] AUDIO RX #\(audioRXCount) len=\(parsed.payload.count)")
+                }
                 onAudioPayload?(parsed.payload)
             } else {
                 log("[BLE] CONTROL RX ch=\(parsed.channel) len=\(parsed.payload.count) HEX=\(K7Protocol.hex(parsed.payload))")

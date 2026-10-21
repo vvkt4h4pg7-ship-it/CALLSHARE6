@@ -4,15 +4,22 @@ struct ContentView: View {
     @EnvironmentObject var app: AppModel
 
     var body: some View {
-        TabView {
+        TabView(selection: $app.selectedTab) {
             PhoneView()
                 .tabItem { Label("Phone", systemImage: "phone.fill") }
+                .tag("phone")
             RecentsView()
                 .tabItem { Label("Recents", systemImage: "clock") }
+                .tag("recents")
             ContactsView()
                 .tabItem { Label("Contacts", systemImage: "person.2") }
+                .tag("contacts")
+            MessagesView()
+                .tabItem { Label("Messages", systemImage: "message") }
+                .tag("messages")
             SettingsView()
                 .tabItem { Label("Settings", systemImage: "gearshape") }
+                .tag("settings")
         }
         .tint(.green)
         .onAppear { app.start() }
@@ -50,18 +57,31 @@ struct PhoneView: View {
     private var statusCard: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Label("Wi-Fi " + app.wifiStatus, systemImage: app.wifiStatus == "Connected" ? "wifi" : "wifi.exclamationmark")
+                Label(app.wifiStatus, systemImage: app.wifiStatus.contains("LISTENING") || app.wifiStatus.contains("ready") ? "wifi" : "wifi.exclamationmark")
                 Spacer()
                 Text("J7 " + app.j7Host).foregroundStyle(.secondary)
             }
             HStack {
                 Label("BLE " + app.bleStatus, systemImage: app.bleStatus == "Connected" ? "dot.radiowaves.left.and.right" : "antenna.radiowaves.left.and.right.slash")
                 Spacer()
+                Text(app.deviceName).foregroundStyle(.secondary).lineLimit(1)
             }
             HStack {
-                Label("iPhone IP", systemImage: "iphone")
+                Text("Call").bold()
                 Spacer()
-                Text(app.iPhoneIPv4).foregroundStyle(.secondary)
+                Text(app.callStatus)
+            }
+            if !app.callerName.isEmpty {
+                HStack {
+                    Text("Caller").bold()
+                    Spacer()
+                    Text(app.callerName)
+                }
+            }
+            HStack {
+                Text("Voice").bold()
+                Spacer()
+                Text(app.voiceStatus)
             }
         }
         .padding()
@@ -158,6 +178,162 @@ struct RecentsView: View {
         case .incoming: return "phone.arrow.down.left"
         case .outgoing: return "phone.arrow.up.right"
         case .missed: return "phone.arrow.down.left"
+        }
+    }
+}
+
+struct MessagesView: View {
+    @EnvironmentObject var app: AppModel
+    @State private var path: [String] = []
+    @State private var search = ""
+
+    private var addresses: [String] {
+        let all = Set(app.smsMessages.map { $0.address })
+        let filtered = all.filter { address in
+            guard !search.isEmpty else { return true }
+            return address.localizedCaseInsensitiveContains(search) ||
+                app.smsMessages.contains { $0.address == address && $0.body.localizedCaseInsensitiveContains(search) }
+        }
+        return filtered.sorted { lhs, rhs in
+            let left = app.smsMessages.filter { $0.address == lhs }.map(\.date).max() ?? .distantPast
+            let right = app.smsMessages.filter { $0.address == rhs }.map(\.date).max() ?? .distantPast
+            return left > right
+        }
+    }
+
+    var body: some View {
+        NavigationStack(path: $path) {
+            List {
+                if addresses.isEmpty {
+                    EmptyStateView(title: "No Messages", systemImage: "message", message: "SMS received on the J7 will appear here. Replies will use the J7 SIM.")
+                } else {
+                    ForEach(addresses, id: \.self) { address in
+                        NavigationLink(value: address) {
+                            let latest = app.smsMessages.filter { $0.address == address }.max { $0.date < $1.date }
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack {
+                                    Text(address).font(.headline)
+                                    Spacer()
+                                    if let latest { Text(latest.date, style: .time).font(.caption).foregroundStyle(.secondary) }
+                                }
+                                if let latest {
+                                    Text(latest.body.replacingOccurrences(of: "\n", with: " "))
+                                        .font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
+                                }
+                            }
+                            .padding(.vertical, 3)
+                        }
+                    }
+                }
+            }
+            .searchable(text: $search, prompt: "Search messages")
+            .navigationTitle("Messages")
+            .navigationDestination(for: String.self) { address in
+                SmsConversationView(address: address)
+            }
+            .onAppear { openPendingConversation() }
+            .onChange(of: app.selectedSMSConversationID) { _ in openPendingConversation() }
+            .overlay(alignment: .bottom) {
+                if !app.smsStatusMessage.isEmpty {
+                    Text(app.smsStatusMessage)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .padding(8)
+                        .background(.thinMaterial, in: Capsule())
+                        .padding(.bottom, 6)
+                }
+            }
+        }
+    }
+
+    private func openPendingConversation() {
+        guard let address = app.selectedSMSConversationID, !address.isEmpty else { return }
+        if path.last != address { path = [address] }
+        app.selectedSMSConversationID = nil
+    }
+}
+
+struct SmsConversationView: View {
+    @EnvironmentObject var app: AppModel
+    let address: String
+    @State private var draft = ""
+
+    private var messages: [SmsMessageRecord] {
+        app.smsMessages.filter { $0.address == address }.sorted { $0.date < $1.date }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 10) {
+                        ForEach(messages) { message in
+                            messageRow(message)
+                                .id(message.id)
+                        }
+                    }
+                    .padding()
+                }
+                .onChange(of: messages.count) { _ in
+                    if let last = messages.last { proxy.scrollTo(last.id, anchor: .bottom) }
+                }
+            }
+
+            Divider()
+            HStack(alignment: .bottom, spacing: 8) {
+                TextField("Text Message", text: $draft, axis: .vertical)
+                    .lineLimit(1...5)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(app.bleStatus != "Connected")
+                Button {
+                    let text = draft
+                    guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+                    app.sendSMS(to: address, body: text)
+                    draft = ""
+                } label: {
+                    Image(systemName: "arrow.up.circle.fill").font(.system(size: 30))
+                }
+                .disabled(app.bleStatus != "Connected" || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            .padding()
+            .background(.bar)
+        }
+        .navigationTitle(address)
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    @ViewBuilder
+    private func messageRow(_ message: SmsMessageRecord) -> some View {
+        HStack {
+            if message.direction == .outgoing { Spacer(minLength: 36) }
+            VStack(alignment: .leading, spacing: 5) {
+                Text(message.body)
+                    .textSelection(.enabled)
+                    .font(.body)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                HStack(spacing: 6) {
+                    Text(message.date, style: .time)
+                    if message.direction == .outgoing { Text(statusText(message.status)) }
+                    if message.direction == .outgoing && (message.status == "failed" || message.status == "sending") {
+                        Button("Retry") { app.retrySMS(message) }
+                            .font(.caption.bold())
+                    }
+                }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            }
+            .padding(11)
+            .background(message.direction == .outgoing ? Color.green.opacity(0.18) : Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 15))
+            if message.direction == .incoming { Spacer(minLength: 36) }
+        }
+    }
+
+    private func statusText(_ status: String) -> String {
+        switch status {
+        case "sending": return "Sending…"
+        case "sent": return "Sent"
+        case "failed": return "Failed"
+        default: return status.capitalized
         }
     }
 }
@@ -355,6 +531,14 @@ struct SettingsView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 14))
 
                     VStack(alignment: .leading, spacing: 10) {
+                        Text("Diagnostics").font(.headline)
+                        NavigationLink("Live Log") { DiagnosticLogView() }
+                    }
+                    .padding()
+                    .background(.thinMaterial)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+
+                    VStack(alignment: .leading, spacing: 10) {
                         Text("About").font(.headline)
                         HStack {
                             Text("CALLSHARE")
@@ -401,5 +585,23 @@ struct SettingsView: View {
         app.j7Host = normalized
         j7HostDraft = normalized
         j7HostError = nil
+    }
+}
+
+struct DiagnosticLogView: View {
+    @EnvironmentObject var app: AppModel
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 4) {
+                ForEach(Array(app.logs.enumerated()), id: \.offset) { _, line in
+                    Text(line)
+                        .font(.system(.caption, design: .monospaced))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .padding()
+        }
+        .navigationTitle("Diagnostic Log")
     }
 }
