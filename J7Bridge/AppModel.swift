@@ -179,7 +179,7 @@ final class AppModel: ObservableObject {
             }
         }
 
-        callKit.onLog = { [weak self] line in self?.log(line) }
+       
         callKit.onStart = { [weak self] number in self?.beginOutgoing(number) }
         callKit.onAnswer = { [weak self] in
             guard let self else { return }
