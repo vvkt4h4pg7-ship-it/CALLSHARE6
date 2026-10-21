@@ -44,8 +44,7 @@ enum K7Protocol {
     static let evtCallshareJ7IPv4: UInt8 = 0xE6
     static let cmdCallsharePeerIPv4: UInt8 = 0xE7
     static let evtCallshareGSMOffhook: UInt8 = 0xE8
-    // CALLSHARE SMS R1 application-owned control extensions; not stock IKOS K7 opcodes.
-    static let cmdCallshareSMSSendChunk: UInt8 = 0xE9
+    static let cmdCallshareSendSMSChunk: UInt8 = 0xE9
     static let evtCallshareSMSStatus: UInt8 = 0xEB
 
     static func makeCallPayload(number: String, simId: UInt8) -> Data {

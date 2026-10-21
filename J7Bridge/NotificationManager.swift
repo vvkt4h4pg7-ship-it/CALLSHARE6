@@ -2,7 +2,7 @@ import Foundation
 import UserNotifications
 
 final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
-    var onSMSNotificationTap: ((String) -> Void)?
+    var onOpenSMS: ((String) -> Void)?
 
     override init() {
         super.init()
@@ -10,7 +10,6 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
     }
 
     func requestPermission() {
-        UNUserNotificationCenter.current().delegate = self
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
     }
 
@@ -27,12 +26,12 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         UNUserNotificationCenter.current().add(request)
     }
 
-    func sendSMS(sender: String, body: String, messageID: String, conversationID: String) {
+    func sendSMS(sender: String, body: String, messageID: String) {
         let content = UNMutableNotificationContent()
         content.title = "CALLSHARE — SMS · \(sender)"
         content.body = body.isEmpty ? "New SMS received on J7" : body
         content.sound = .default
-        content.userInfo = ["messageID": messageID, "conversationID": conversationID]
+        content.userInfo = ["callshare.smsID": messageID]
         let request = UNNotificationRequest(
             identifier: "callshare.sms.\(messageID)",
             content: content,
@@ -41,20 +40,15 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         UNUserNotificationCenter.current().add(request)
     }
 
-    func userNotificationCenter(_ center: UNUserNotificationCenter,
-                                didReceive response: UNNotificationResponse,
-                                withCompletionHandler completionHandler: @escaping () -> Void) {
-        let userInfo = response.notification.request.content.userInfo
-        if response.notification.request.identifier.hasPrefix("callshare.sms."),
-           let conversationID = userInfo["conversationID"] as? String {
-            DispatchQueue.main.async { [weak self] in self?.onSMSNotificationTap?(conversationID) }
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let messageID = response.notification.request.content.userInfo["callshare.smsID"] as? String
+        if let messageID {
+            DispatchQueue.main.async { [weak self] in self?.onOpenSMS?(messageID) }
         }
         completionHandler()
-    }
-
-    func userNotificationCenter(_ center: UNUserNotificationCenter,
-                                willPresent notification: UNNotification,
-                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
-        completionHandler([.banner, .sound, .badge])
     }
 }

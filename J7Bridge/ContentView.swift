@@ -7,19 +7,19 @@ struct ContentView: View {
         TabView(selection: $app.selectedTab) {
             PhoneView()
                 .tabItem { Label("Phone", systemImage: "phone.fill") }
-                .tag("phone")
+                .tag(0)
             RecentsView()
                 .tabItem { Label("Recents", systemImage: "clock") }
-                .tag("recents")
+                .tag(1)
             ContactsView()
                 .tabItem { Label("Contacts", systemImage: "person.2") }
-                .tag("contacts")
-            MessagesView()
-                .tabItem { Label("Messages", systemImage: "message") }
-                .tag("messages")
+                .tag(2)
+            SMSInboxView()
+                .tabItem { Label("Messages", systemImage: "message.fill") }
+                .tag(3)
             SettingsView()
                 .tabItem { Label("Settings", systemImage: "gearshape") }
-                .tag("settings")
+                .tag(4)
         }
         .tint(.green)
         .onAppear { app.start() }
@@ -57,31 +57,18 @@ struct PhoneView: View {
     private var statusCard: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Label(app.wifiStatus, systemImage: app.wifiStatus.contains("LISTENING") || app.wifiStatus.contains("ready") ? "wifi" : "wifi.exclamationmark")
+                Label("Wi-Fi " + app.wifiStatus, systemImage: app.wifiStatus == "Connected" ? "wifi" : "wifi.exclamationmark")
                 Spacer()
                 Text("J7 " + app.j7Host).foregroundStyle(.secondary)
             }
             HStack {
                 Label("BLE " + app.bleStatus, systemImage: app.bleStatus == "Connected" ? "dot.radiowaves.left.and.right" : "antenna.radiowaves.left.and.right.slash")
                 Spacer()
-                Text(app.deviceName).foregroundStyle(.secondary).lineLimit(1)
             }
             HStack {
-                Text("Call").bold()
+                Label("iPhone IP", systemImage: "iphone")
                 Spacer()
-                Text(app.callStatus)
-            }
-            if !app.callerName.isEmpty {
-                HStack {
-                    Text("Caller").bold()
-                    Spacer()
-                    Text(app.callerName)
-                }
-            }
-            HStack {
-                Text("Voice").bold()
-                Spacer()
-                Text(app.voiceStatus)
+                Text(app.iPhoneIPv4).foregroundStyle(.secondary)
             }
         }
         .padding()
@@ -182,162 +169,6 @@ struct RecentsView: View {
     }
 }
 
-struct MessagesView: View {
-    @EnvironmentObject var app: AppModel
-    @State private var path: [String] = []
-    @State private var search = ""
-
-    private var addresses: [String] {
-        let all = Set(app.smsMessages.map { $0.address })
-        let filtered = all.filter { address in
-            guard !search.isEmpty else { return true }
-            return address.localizedCaseInsensitiveContains(search) ||
-                app.smsMessages.contains { $0.address == address && $0.body.localizedCaseInsensitiveContains(search) }
-        }
-        return filtered.sorted { lhs, rhs in
-            let left = app.smsMessages.filter { $0.address == lhs }.map(\.date).max() ?? .distantPast
-            let right = app.smsMessages.filter { $0.address == rhs }.map(\.date).max() ?? .distantPast
-            return left > right
-        }
-    }
-
-    var body: some View {
-        NavigationStack(path: $path) {
-            List {
-                if addresses.isEmpty {
-                    EmptyStateView(title: "No Messages", systemImage: "message", message: "SMS received on the J7 will appear here. Replies will use the J7 SIM.")
-                } else {
-                    ForEach(addresses, id: \.self) { address in
-                        NavigationLink(value: address) {
-                            let latest = app.smsMessages.filter { $0.address == address }.max { $0.date < $1.date }
-                            VStack(alignment: .leading, spacing: 4) {
-                                HStack {
-                                    Text(address).font(.headline)
-                                    Spacer()
-                                    if let latest { Text(latest.date, style: .time).font(.caption).foregroundStyle(.secondary) }
-                                }
-                                if let latest {
-                                    Text(latest.body.replacingOccurrences(of: "\n", with: " "))
-                                        .font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
-                                }
-                            }
-                            .padding(.vertical, 3)
-                        }
-                    }
-                }
-            }
-            .searchable(text: $search, prompt: "Search messages")
-            .navigationTitle("Messages")
-            .navigationDestination(for: String.self) { address in
-                SmsConversationView(address: address)
-            }
-            .onAppear { openPendingConversation() }
-            .onChange(of: app.selectedSMSConversationID) { _ in openPendingConversation() }
-            .overlay(alignment: .bottom) {
-                if !app.smsStatusMessage.isEmpty {
-                    Text(app.smsStatusMessage)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .padding(8)
-                        .background(.thinMaterial, in: Capsule())
-                        .padding(.bottom, 6)
-                }
-            }
-        }
-    }
-
-    private func openPendingConversation() {
-        guard let address = app.selectedSMSConversationID, !address.isEmpty else { return }
-        if path.last != address { path = [address] }
-        app.selectedSMSConversationID = nil
-    }
-}
-
-struct SmsConversationView: View {
-    @EnvironmentObject var app: AppModel
-    let address: String
-    @State private var draft = ""
-
-    private var messages: [SmsMessageRecord] {
-        app.smsMessages.filter { $0.address == address }.sorted { $0.date < $1.date }
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(spacing: 10) {
-                        ForEach(messages) { message in
-                            messageRow(message)
-                                .id(message.id)
-                        }
-                    }
-                    .padding()
-                }
-                .onChange(of: messages.count) { _ in
-                    if let last = messages.last { proxy.scrollTo(last.id, anchor: .bottom) }
-                }
-            }
-
-            Divider()
-            HStack(alignment: .bottom, spacing: 8) {
-                TextField("Text Message", text: $draft, axis: .vertical)
-                    .lineLimit(1...5)
-                    .textFieldStyle(.roundedBorder)
-                    .disabled(app.bleStatus != "Connected")
-                Button {
-                    let text = draft
-                    guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-                    app.sendSMS(to: address, body: text)
-                    draft = ""
-                } label: {
-                    Image(systemName: "arrow.up.circle.fill").font(.system(size: 30))
-                }
-                .disabled(app.bleStatus != "Connected" || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }
-            .padding()
-            .background(.bar)
-        }
-        .navigationTitle(address)
-        .navigationBarTitleDisplayMode(.inline)
-    }
-
-    @ViewBuilder
-    private func messageRow(_ message: SmsMessageRecord) -> some View {
-        HStack {
-            if message.direction == .outgoing { Spacer(minLength: 36) }
-            VStack(alignment: .leading, spacing: 5) {
-                Text(message.body)
-                    .textSelection(.enabled)
-                    .font(.body)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                HStack(spacing: 6) {
-                    Text(message.date, style: .time)
-                    if message.direction == .outgoing { Text(statusText(message.status)) }
-                    if message.direction == .outgoing && (message.status == "failed" || message.status == "sending") {
-                        Button("Retry") { app.retrySMS(message) }
-                            .font(.caption.bold())
-                    }
-                }
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            }
-            .padding(11)
-            .background(message.direction == .outgoing ? Color.green.opacity(0.18) : Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 15))
-            if message.direction == .incoming { Spacer(minLength: 36) }
-        }
-    }
-
-    private func statusText(_ status: String) -> String {
-        switch status {
-        case "sending": return "Sending…"
-        case "sent": return "Sent"
-        case "failed": return "Failed"
-        default: return status.capitalized
-        }
-    }
-}
-
 struct ContactsView: View {
     @EnvironmentObject var app: AppModel
     @State private var search = ""
@@ -422,6 +253,216 @@ struct EmptyStateView: View {
         }
         .frame(maxWidth: .infinity, minHeight: 220)
         .padding()
+    }
+}
+
+
+struct SMSInboxView: View {
+    @EnvironmentObject var app: AppModel
+    @State private var path: [CallshareSMSRoute] = []
+
+    var body: some View {
+        NavigationStack(path: $path) {
+            Group {
+                if app.smsConversations.isEmpty {
+                    EmptyStateView(
+                        title: "No Messages Yet",
+                        systemImage: "message",
+                        message: "Incoming SMS messages from the J7 SIM will appear here while CALLSHARE is connected over BLE."
+                    )
+                } else {
+                    List(app.smsConversations) { conversation in
+                        NavigationLink(value: CallshareSMSRoute(address: conversation.address, targetMessageID: nil)) {
+                            HStack(spacing: 12) {
+                                Image(systemName: "message.fill")
+                                    .font(.title2)
+                                    .foregroundStyle(.green)
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack {
+                                        Text(conversation.address).font(.headline)
+                                        Spacer(minLength: 8)
+                                        Text(conversation.latestMessage.date, style: .time)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Text(conversation.latestMessage.body.isEmpty ? "(Empty message)" : conversation.latestMessage.body)
+                                        .font(.subheadline)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(2)
+                                    HStack(spacing: 6) {
+                                        Text(conversation.latestMessage.isOutgoing ? "You" : "Received")
+                                        Text("·")
+                                        Text(smsStatusLabel(conversation.latestMessage))
+                                        if conversation.unreadCount > 0 {
+                                            Spacer(minLength: 4)
+                                            Text("NEW")
+                                                .font(.caption2.bold())
+                                                .foregroundStyle(.green)
+                                        }
+                                    }
+                                    .font(.caption2)
+                                    .foregroundStyle(conversation.latestMessage.status.caseInsensitiveCompare("failed") == .orderedSame ? Color.red : Color.secondary)
+                                }
+                            }
+                            .padding(.vertical, 3)
+                        }
+                    }
+                    .listStyle(.plain)
+                }
+            }
+            .navigationTitle("Messages")
+            .navigationDestination(for: CallshareSMSRoute.self) { route in
+                SMSConversationView(address: route.address, targetMessageID: route.targetMessageID)
+            }
+            .onAppear { routePendingNotification() }
+            .onChange(of: app.pendingSMSNavigationID) { _ in routePendingNotification() }
+        }
+    }
+
+    private func routePendingNotification() {
+        guard let messageID = app.pendingSMSNavigationID else { return }
+        app.pendingSMSNavigationID = nil
+        guard let message = app.smsMessage(id: messageID) else { return }
+        path.append(CallshareSMSRoute(address: message.address, targetMessageID: message.id))
+    }
+}
+
+struct SMSConversationView: View {
+    @EnvironmentObject var app: AppModel
+    let address: String
+    let targetMessageID: String?
+    @State private var draft = ""
+    @State private var showSendError = false
+    @State private var sendError = "The SMS could not be queued. Check BLE connection and the recipient number."
+
+    private var messages: [CallshareSMSMessage] {
+        app.smsMessages.filter { $0.address == address }.sorted { $0.timestampMs < $1.timestampMs }
+    }
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 12) {
+                    ForEach(messages) { message in
+                        VStack(alignment: message.isOutgoing ? .trailing : .leading, spacing: 5) {
+                            Text(message.body.isEmpty ? "(Empty message)" : message.body)
+                                .font(.body)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: message.isOutgoing ? .trailing : .leading)
+                            HStack(spacing: 8) {
+                                Text(message.date, style: .date)
+                                Text(message.date, style: .time)
+                                Text("·")
+                                Text(smsStatusLabel(message))
+                                if message.isOutgoing && message.status.caseInsensitiveCompare("failed") == .orderedSame {
+                                    Button("Retry") {
+                                        if !app.retrySMS(id: message.id) {
+                                            sendError = "Retry could not be queued. Confirm BLE is connected and try again."
+                                            showSendError = true
+                                        }
+                                    }
+                                    .font(.caption.bold())
+                                    .foregroundStyle(.red)
+                                }
+                            }
+                            .font(.caption2)
+                            .foregroundStyle(message.status.caseInsensitiveCompare("failed") == .orderedSame ? Color.red : Color.secondary)
+                        }
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: message.isOutgoing ? .trailing : .leading)
+                        .background(
+                            message.isOutgoing ? Color.green.opacity(0.18) : Color.gray.opacity(0.18),
+                            in: RoundedRectangle(cornerRadius: 16)
+                        )
+                        .overlay {
+                            if message.id == targetMessageID {
+                                RoundedRectangle(cornerRadius: 16).stroke(Color.green.opacity(0.8), lineWidth: 1.5)
+                            }
+                        }
+                        .id(message.id)
+                    }
+                }
+                .padding()
+            }
+            .onAppear {
+                app.markSMSRead(forAddress: address)
+                scrollToInitialMessage(using: proxy)
+            }
+            .onChange(of: messages.count) { _ in
+                guard targetMessageID == nil, let latest = messages.last else { return }
+                withAnimation { proxy.scrollTo(latest.id, anchor: .bottom) }
+            }
+        }
+        .safeAreaInset(edge: .bottom) {
+            HStack(alignment: .bottom, spacing: 10) {
+                TextField("Text Message", text: $draft, axis: .vertical)
+                    .lineLimit(1...4)
+                    .textInputAutocapitalization(.sentences)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+                Button(action: sendReply) {
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.system(size: 34))
+                        .foregroundStyle(canSend ? Color.green : Color.secondary)
+                }
+                .disabled(!canSend)
+                .accessibilityLabel("Send SMS")
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 8)
+            .background(.ultraThinMaterial)
+        }
+        .navigationTitle(address)
+        .navigationBarTitleDisplayMode(.inline)
+        .alert("SMS Not Sent", isPresented: $showSendError) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(sendError)
+        }
+        .onAppear { app.markSMSRead(forAddress: address) }
+    }
+
+    private var canSend: Bool {
+        !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && app.ble.isReady
+    }
+
+    private func sendReply() {
+        let body = draft
+        guard app.sendSMSReply(to: address, body: body) else {
+            sendError = "SMS could not be queued. Check that BLE GATT is connected and the number is valid."
+            showSendError = true
+            return
+        }
+        draft = ""
+    }
+
+    private func scrollToInitialMessage(using proxy: ScrollViewProxy) {
+        if let targetMessageID, messages.contains(where: { $0.id == targetMessageID }) {
+            DispatchQueue.main.async {
+                proxy.scrollTo(targetMessageID, anchor: .center)
+            }
+        } else if let latest = messages.last {
+            DispatchQueue.main.async {
+                proxy.scrollTo(latest.id, anchor: .bottom)
+            }
+        }
+    }
+}
+
+private func smsStatusLabel(_ message: CallshareSMSMessage) -> String {
+    let status = message.status.trimmingCharacters(in: .whitespacesAndNewlines)
+    if status.isEmpty { return message.isOutgoing ? "Sending" : "Received" }
+    if status.caseInsensitiveCompare("failed") == .orderedSame {
+        if let detail = message.statusDetail, !detail.isEmpty { return "Failed · \(detail)" }
+        return "Failed"
+    }
+    switch status.lowercased() {
+    case "sending", "pending", "queued": return "Sending"
+    case "sent", "success": return "Sent"
+    case "delivered": return "Delivered"
+    case "received", "incoming": return "Received"
+    default: return status.capitalized
     }
 }
 
@@ -531,14 +572,6 @@ struct SettingsView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 14))
 
                     VStack(alignment: .leading, spacing: 10) {
-                        Text("Diagnostics").font(.headline)
-                        NavigationLink("Live Log") { DiagnosticLogView() }
-                    }
-                    .padding()
-                    .background(.thinMaterial)
-                    .clipShape(RoundedRectangle(cornerRadius: 14))
-
-                    VStack(alignment: .leading, spacing: 10) {
                         Text("About").font(.headline)
                         HStack {
                             Text("CALLSHARE")
@@ -585,23 +618,5 @@ struct SettingsView: View {
         app.j7Host = normalized
         j7HostDraft = normalized
         j7HostError = nil
-    }
-}
-
-struct DiagnosticLogView: View {
-    @EnvironmentObject var app: AppModel
-
-    var body: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 4) {
-                ForEach(Array(app.logs.enumerated()), id: \.offset) { _, line in
-                    Text(line)
-                        .font(.system(.caption, design: .monospaced))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-            }
-            .padding()
-        }
-        .navigationTitle("Diagnostic Log")
     }
 }
