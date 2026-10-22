@@ -130,23 +130,32 @@ struct RecentsView: View {
                     EmptyStateView(title: "No Calls", systemImage: "clock", message: "J7Bridge call history will appear here.")
                 } else {
                     ForEach(app.history.records) { record in
-                        HStack(spacing: 12) {
-                            Image(systemName: icon(for: record.direction))
-                                .foregroundStyle(record.direction == .missed ? .red : .green)
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(record.name ?? record.number).font(.headline)
-                                if let name = record.name { Text(record.number).font(.caption).foregroundStyle(.secondary) }
+                        Button {
+                            app.makeCall(to: record.number)
+                        } label: {
+                            HStack(spacing: 12) {
+                                Image(systemName: icon(for: record.direction))
+                                    .foregroundStyle(record.direction == .missed ? .red : .green)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(record.name ?? record.number).font(.headline)
+                                    if record.name != nil {
+                                        Text(record.number).font(.caption).foregroundStyle(.secondary)
+                                    }
+                                }
+                                Spacer()
+                                VStack(alignment: .trailing, spacing: 3) {
+                                    Text(record.date, style: .time).font(.caption)
+                                    Text(record.direction.rawValue.capitalized).font(.caption2).foregroundStyle(.secondary)
+                                }
                             }
-                            Spacer()
-                            VStack(alignment: .trailing, spacing: 3) {
-                                Text(record.date, style: .time).font(.caption)
-                                Text(record.direction.rawValue.capitalized).font(.caption2).foregroundStyle(.secondary)
-                            }
+                            .contentShape(Rectangle())
                         }
+                        .buttonStyle(.plain)
                         .swipeActions {
-                            Button { app.dialString = record.number } label: {
-                                Label("Dial", systemImage: "phone.fill")
+                            Button { app.makeCall(to: record.number) } label: {
+                                Label("Call", systemImage: "phone.fill")
                             }
+                            .tint(.green)
                         }
                     }
                 }
@@ -189,10 +198,34 @@ struct ContactsView: View {
                 } else {
                     List(filtered) { contact in
                         VStack(alignment: .leading, spacing: 5) {
-                            Text(contact.displayName).font(.headline)
-                            ForEach(contact.phones, id: \.self) { phone in
-                                Button(phone) { app.dialString = phone }
-                                    .font(.subheadline)
+                            // Tapping a contact starts a call to its primary phone number.
+                            Button {
+                                if let phone = contact.phones.first {
+                                    app.makeCall(to: phone)
+                                }
+                            } label: {
+                                HStack(spacing: 12) {
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(contact.displayName).font(.headline)
+                                        if let phone = contact.phones.first {
+                                            Text(phone).font(.subheadline).foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    Spacer()
+                                    Image(systemName: "phone.fill").foregroundStyle(.green)
+                                }
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+
+                            // Extra numbers remain individually selectable for contacts with multiple numbers.
+                            ForEach(Array(contact.phones.dropFirst()), id: \.self) { phone in
+                                Button {
+                                    app.makeCall(to: phone)
+                                } label: {
+                                    Label(phone, systemImage: "phone")
+                                }
+                                .font(.subheadline)
                             }
                         }
                     }

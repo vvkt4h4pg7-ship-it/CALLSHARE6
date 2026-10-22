@@ -224,6 +224,26 @@ final class AppModel: ObservableObject {
         callKit.startOutgoing(number: cleaned)
     }
 
+    // Start a real CALLSHARE GSM call from a selected contact or a recent call.
+    // Keep this on the existing CallKit -> BLE MAKE_CALL path used by the keypad.
+    func makeCall(to rawNumber: String) {
+        guard callStatus == "IDLE" || callStatus == "ENDED" else {
+            log("[CALL] Ignored selected-number call while status=\(callStatus)")
+            return
+        }
+
+        // Contacts often store phone numbers with spaces, dashes or parentheses.
+        // Strip formatting while keeping common telephone characters.
+        let cleaned = rawNumber.filter { $0.isNumber || $0 == "+" || $0 == "*" || $0 == "#" }
+        guard !cleaned.isEmpty, cleaned.contains(where: { $0.isNumber }) else {
+            log("[CALL] Ignored invalid selected phone number")
+            return
+        }
+
+        dialString = cleaned
+        makeCall()
+    }
+
     func endCall() { callKit.endCurrentCall() }
 
     func tapDialpad(_ digit: String) {
