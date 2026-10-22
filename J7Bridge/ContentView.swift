@@ -3,25 +3,39 @@ import SwiftUI
 struct ContentView: View {
     @EnvironmentObject var app: AppModel
 
+    private var shouldShowCallScreen: Bool {
+        app.callStatus == "DIALING" || app.callStatus == "RINGING" || app.callStatus == "ACTIVE"
+    }
+
     var body: some View {
-        TabView(selection: $app.selectedTab) {
-            PhoneView()
-                .tabItem { Label("Phone", systemImage: "phone.fill") }
-                .tag(0)
-            RecentsView()
-                .tabItem { Label("Recents", systemImage: "clock") }
-                .tag(1)
-            ContactsView()
-                .tabItem { Label("Contacts", systemImage: "person.2") }
-                .tag(2)
-            SMSInboxView()
-                .tabItem { Label("Messages", systemImage: "message.fill") }
-                .tag(3)
-            SettingsView()
-                .tabItem { Label("Settings", systemImage: "gearshape") }
-                .tag(4)
+        ZStack {
+            TabView(selection: $app.selectedTab) {
+                PhoneView()
+                    .tabItem { Label("Phone", systemImage: "phone.fill") }
+                    .tag(0)
+                RecentsView()
+                    .tabItem { Label("Recents", systemImage: "clock") }
+                    .tag(1)
+                ContactsView()
+                    .tabItem { Label("Contacts", systemImage: "person.2") }
+                    .tag(2)
+                SMSInboxView()
+                    .tabItem { Label("Messages", systemImage: "message.fill") }
+                    .tag(3)
+                SettingsView()
+                    .tabItem { Label("Settings", systemImage: "gearshape") }
+                    .tag(4)
+            }
+            .tint(.green)
+
+            if shouldShowCallScreen {
+                InAppCallView()
+                    .environmentObject(app)
+                    .transition(.opacity)
+                    .zIndex(1)
+            }
         }
-        .tint(.green)
+        .animation(.easeInOut(duration: 0.18), value: app.callStatus)
         .onAppear { app.start() }
     }
 }
@@ -697,3 +711,222 @@ struct SettingsView: View {
         j7HostError = nil
     }
 }
+
+// CALLSHARE's in-app call screen. The existing CallKit/BLE/audio call path remains authoritative.
+struct InAppCallView: View {
+    @EnvironmentObject var app: AppModel
+    @State private var showsKeypad = false
+
+    private let keypadDigits = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "0", "#"]
+
+    private var displayName: String {
+        let name = app.callerName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !name.isEmpty { return name }
+        return app.number.isEmpty ? "Unknown caller" : app.number
+    }
+
+    private var avatarInitial: String {
+        String(displayName.trimmingCharacters(in: .whitespacesAndNewlines).prefix(1)).uppercased()
+    }
+
+    var body: some View {
+        ZStack {
+            LinearGradient(
+                colors: [
+                    Color(red: 0.08, green: 0.15, blue: 0.22),
+                    Color(red: 0.025, green: 0.045, blue: 0.075),
+                    Color(red: 0.015, green: 0.025, blue: 0.045)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                HStack {
+                    Image(systemName: "wave.3.right")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(.green)
+                    Text("CALLSHARE")
+                        .font(.system(size: 14, weight: .bold, design: .rounded))
+                        .tracking(2.2)
+                    Spacer()
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(app.bleStatus == "Connected" ? Color.green : Color.orange)
+                            .frame(width: 7, height: 7)
+                        Text(app.bleStatus == "Connected" ? "J7 CONNECTED" : "CONNECTING")
+                            .font(.system(size: 10, weight: .semibold, design: .rounded))
+                            .tracking(0.7)
+                            .foregroundStyle(.white.opacity(0.75))
+                    }
+                }
+                .padding(.horizontal, 26)
+                .padding(.top, 20)
+
+                Spacer(minLength: 18)
+
+                VStack(spacing: 14) {
+                    ZStack {
+                        Circle()
+                            .fill(Color.white.opacity(0.055))
+                            .frame(width: 152, height: 152)
+                        Circle()
+                            .fill(
+                                LinearGradient(
+                                    colors: [Color(red: 0.18, green: 0.55, blue: 0.48), Color(red: 0.08, green: 0.28, blue: 0.34)],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                )
+                            )
+                            .frame(width: 124, height: 124)
+                            .overlay {
+                                Text(avatarInitial.isEmpty ? "?" : avatarInitial)
+                                    .font(.system(size: 46, weight: .medium, design: .rounded))
+                                    .foregroundStyle(.white)
+                            }
+                    }
+
+                    Text(displayName)
+                        .font(.system(size: 29, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.white)
+                        .multilineTextAlignment(.center)
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.72)
+                        .padding(.horizontal, 26)
+
+                    if !app.callerName.isEmpty && !app.number.isEmpty {
+                        Text(app.number)
+                            .font(.system(size: 16, weight: .medium, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.67))
+                    }
+
+                    TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                        Text(statusText(at: timeline.date))
+                            .font(.system(size: 15, weight: .medium, design: .rounded))
+                            .foregroundStyle(app.callStatus == "ACTIVE" ? Color.green : Color.white.opacity(0.78))
+                    }
+                    .padding(.top, 2)
+
+                    if app.callStatus == "ACTIVE" {
+                        Label(app.voiceStatus == "ACTIVE" ? "Voice connected" : "Setting up audio", systemImage: app.voiceStatus == "ACTIVE" ? "waveform" : "hourglass")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.62))
+                            .padding(.top, 1)
+                    } else if app.callStatus == "DIALING" {
+                        Text("Calling through the J7 SIM")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.58))
+                    }
+                }
+
+                Spacer(minLength: 20)
+
+                if showsKeypad && app.callStatus == "ACTIVE" {
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 18), count: 3), spacing: 12) {
+                        ForEach(keypadDigits, id: \.self) { digit in
+                            Button { app.tapDialpad(digit) } label: {
+                                Text(digit)
+                                    .font(.system(size: 24, weight: .medium, design: .rounded))
+                                    .foregroundStyle(.white)
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: 48)
+                                    .background(Color.white.opacity(0.10), in: Circle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Send DTMF \(digit)")
+                        }
+                    }
+                    .padding(.horizontal, 48)
+                    .padding(.bottom, 16)
+                }
+
+                if app.callStatus == "RINGING" {
+                    HStack(spacing: 54) {
+                        actionButton(title: "Decline", symbol: "phone.down.fill", color: Color(red: 0.83, green: 0.20, blue: 0.25)) {
+                            app.endCall()
+                        }
+                        actionButton(title: "Answer", symbol: "phone.fill", color: Color(red: 0.15, green: 0.68, blue: 0.36)) {
+                            app.answerCurrentCallFromInAppScreen()
+                        }
+                    }
+                    .padding(.bottom, 48)
+                } else {
+                    HStack(spacing: 30) {
+                        if app.callStatus == "ACTIVE" {
+                            actionButton(
+                                title: app.isMuted ? "Unmute" : "Mute",
+                                symbol: app.isMuted ? "mic.slash.fill" : "mic.fill",
+                                color: app.isMuted ? Color(red: 0.15, green: 0.48, blue: 0.38) : Color.white.opacity(0.13)
+                            ) {
+                                app.toggleMuteFromInAppScreen()
+                            }
+
+                            actionButton(
+                                title: showsKeypad ? "Hide Keypad" : "Keypad",
+                                symbol: "circle.grid.3x3.fill",
+                                color: Color.white.opacity(0.13)
+                            ) {
+                                withAnimation(.easeInOut(duration: 0.15)) { showsKeypad.toggle() }
+                            }
+                        }
+
+                        actionButton(title: "End Call", symbol: "phone.down.fill", color: Color(red: 0.83, green: 0.20, blue: 0.25)) {
+                            app.endCall()
+                        }
+                    }
+                    .padding(.bottom, 48)
+                }
+            }
+        }
+        .foregroundStyle(.white)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("CALLSHARE call screen")
+    }
+
+    private func statusText(at date: Date) -> String {
+        switch app.callStatus {
+        case "RINGING":
+            return "Incoming GSM call"
+        case "DIALING":
+            return "Calling…"
+        case "ACTIVE":
+            guard let connectedAt = app.callConnectedAt else { return "Connected" }
+            let elapsed = max(0, Int(date.timeIntervalSince(connectedAt)))
+            return "Connected · \(formattedDuration(elapsed))"
+        default:
+            return "Connecting…"
+        }
+    }
+
+    private func formattedDuration(_ seconds: Int) -> String {
+        let hours = seconds / 3600
+        let minutes = (seconds % 3600) / 60
+        let remainingSeconds = seconds % 60
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, remainingSeconds)
+        }
+        return String(format: "%02d:%02d", minutes, remainingSeconds)
+    }
+
+    private func actionButton(title: String, symbol: String, color: Color, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 10) {
+                Image(systemName: symbol)
+                    .font(.system(size: 23, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 66, height: 66)
+                    .background(color, in: Circle())
+                Text(title)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.86))
+                    .lineLimit(1)
+            }
+            .frame(minWidth: 72)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+

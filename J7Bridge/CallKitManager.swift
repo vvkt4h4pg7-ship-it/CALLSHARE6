@@ -65,6 +65,26 @@ final class CallKitManager: NSObject {
         CXCallController().request(transaction) { _ in }
     }
 
+    func answerCurrentCall() {
+        guard let uuid = currentUUID else { return }
+        let action = CXAnswerCallAction(call: uuid)
+        CXCallController().request(CXTransaction(action: action)) { error in
+            if let error {
+                NSLog("[CallKit] In-app answer request failed: %@", error.localizedDescription)
+            }
+        }
+    }
+
+    func setMuted(_ muted: Bool) {
+        guard let uuid = currentUUID else { return }
+        let action = CXSetMutedCallAction(call: uuid, muted: muted)
+        CXCallController().request(CXTransaction(action: action)) { error in
+            if let error {
+                NSLog("[CallKit] In-app mute request failed: %@", error.localizedDescription)
+            }
+        }
+    }
+
     func fulfillAnswerIfNeeded() {
         answerAction?.fulfill()
         answerAction = nil

@@ -64,6 +64,7 @@ final class AppModel: ObservableObject {
     @Published var imei = "-"
     @Published var isMuted = false
     @Published private(set) var callStartedAt: Date?
+    @Published private(set) var callConnectedAt: Date?
     @Published private(set) var smsMessages: [CallshareSMSMessage] = []
     @Published var selectedTab = 0
     @Published var pendingSMSNavigationID: String?
@@ -246,6 +247,16 @@ final class AppModel: ObservableObject {
 
     func endCall() { callKit.endCurrentCall() }
 
+    // Route in-app controls through CallKit so they share the same callbacks as iOS controls.
+    func answerCurrentCallFromInAppScreen() {
+        guard callStatus == "RINGING" else { return }
+        callKit.answerCurrentCall()
+    }
+
+    func toggleMuteFromInAppScreen() {
+        callKit.setMuted(!isMuted)
+    }
+
     func tapDialpad(_ digit: String) {
         if callStatus == "ACTIVE" { sendDTMFString(digit) }
         else { dialString.append(digit) }
@@ -283,6 +294,7 @@ final class AppModel: ObservableObject {
             handleIncoming(payload)
         case K7Protocol.evtAnswer:
             callStatus = "ACTIVE"
+            if callConnectedAt == nil { callConnectedAt = Date() }
             log("[CALL] BLE ANSWER EVENT / ACTIVE; waiting for physical GSM OFFHOOK before opening audio")
             if currentDirection == .outgoing { callKit.reportOutgoingConnected() }
             callKit.fulfillAnswerIfNeeded()
@@ -343,6 +355,7 @@ final class AppModel: ObservableObject {
         currentContactName = name
         currentDirection = .incoming
         callStartedAt = Date()
+        callConnectedAt = nil
         callAudioActive = false
         remoteVoiceOpen = false
         gsmCallReady = false
@@ -370,6 +383,7 @@ final class AppModel: ObservableObject {
         currentDirection = direction
         currentContactName = name
         callStartedAt = Date()
+        callConnectedAt = nil
         callAudioActive = false
         remoteVoiceOpen = false
         gsmCallReady = false
@@ -461,6 +475,7 @@ final class AppModel: ObservableObject {
             }
         }
         callStartedAt = nil
+        callConnectedAt = nil
         currentDirection = nil
         currentContactName = nil
         callAudioActive = false
