@@ -330,6 +330,18 @@ final class AppModel: ObservableObject {
             gsmCallReady = true
             log("[HYBRID] J7 GSM OFFHOOK event received; CallKit=\(callAudioActive ? "active" : "not active")")
             requestVoiceOpenIfReady()
+        case K7Protocol.evtCallshareCallActive:
+            // OFFHOOK includes outgoing dialing. Start the visible call timer only
+            // when the Android Telecom state probe confirms the remote party answered.
+            guard currentDirection == .outgoing, callStatus == "DIALING" else {
+                log("[CALL] Ignored GSM ACTIVE confirmation outside outgoing dialing state")
+                break
+            }
+            callStatus = "ACTIVE"
+            if callConnectedAt == nil { callConnectedAt = Date() }
+            callKit.reportOutgoingConnected()
+            log("[CALL] J7 Telecom confirmed outgoing GSM call ACTIVE; connected timer started")
+            requestVoiceOpenIfReady()
         case K7Protocol.evtCallshareJ7IPv4:
             handleJ7IPv4(payload)
         case K7Protocol.evtCallshareSMS:
@@ -398,7 +410,7 @@ final class AppModel: ObservableObject {
     }
 
     private func requestVoiceOpenIfReady() {
-        let outgoingMayOpen = currentDirection == .outgoing && callStatus == "DIALING"
+        let outgoingMayOpen = currentDirection == .outgoing && (callStatus == "DIALING" || callStatus == "ACTIVE")
         let incomingMayOpen = currentDirection == .incoming && callStatus == "ACTIVE"
         guard callAudioActive, gsmCallReady, outgoingMayOpen || incomingMayOpen else { return }
         guard !voiceOpenCommandSent else { return }

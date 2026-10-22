@@ -46,6 +46,8 @@ enum K7Protocol {
     static let evtCallshareGSMOffhook: UInt8 = 0xE8
     static let cmdCallshareSendSMSChunk: UInt8 = 0xE9
     static let evtCallshareSMSStatus: UInt8 = 0xEB
+    // Sent only after Android Telecom reports the outgoing GSM call as ACTIVE.
+    static let evtCallshareCallActive: UInt8 = 0xEC
 
     static func makeCallPayload(number: String, simId: UInt8) -> Data {
         var data = Data([cmdMakeCall, simId])
