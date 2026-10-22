@@ -70,6 +70,8 @@ final class AppModel: ObservableObject {
 
     private var incomingSMSAssemblies: [String: IncomingSMSAssembly] = [:]
     private let smsMessagesDefaultsKey = "j7bridge.smsMessages.v1"
+    private let smsDeletedConversationsDefaultsKey = "j7bridge.smsDeletedConversations.v1"
+    private var deletedSMSConversationAddresses: Set<String> = []
     private static let smsChunkBytes = 36
     private static let smsMaxBodyBytes = 16_384
     private static let smsHistoryLimit = 200
@@ -132,6 +134,10 @@ final class AppModel: ObservableObject {
         contacts = ContactsManager()
         history = CallHistoryStore()
         smsMessages = Self.loadSMSMessages(forKey: smsMessagesDefaultsKey)
+        deletedSMSConversationAddresses = Self.loadDeletedSMSConversationAddresses(forKey: smsDeletedConversationsDefaultsKey)
+        if !deletedSMSConversationAddresses.isEmpty {
+            smsMessages.removeAll { deletedSMSConversationAddresses.contains(Self.canonicalSMSAddress($0.address)) }
+        }
 
         notifications.onOpenSMS = { [weak self] messageID in
             guard let self else { return }
@@ -475,6 +481,7 @@ final class AppModel: ObservableObject {
             let messageID = "legacy-\(UUID().uuidString.lowercased())"
             let nowMs = Int64(Date().timeIntervalSince1970 * 1_000.0)
             let address = Self.canonicalSMSAddress(sender)
+            restoreSMSConversation(forAddress: address)
             let message = CallshareSMSMessage(
                 id: messageID, address: address, body: body, direction: "incoming",
                 timestampMs: nowMs, status: "received", statusDetail: nil, isUnread: true
@@ -562,6 +569,14 @@ final class AppModel: ObservableObject {
             return
         }
 
+        // If this is replayed bridge history, keep conversations deliberately deleted on this iPhone hidden.
+        // A genuinely new (non-replay) SMS from the same sender restores that conversation.
+        if assembly.replay && deletedSMSConversationAddresses.contains(address) {
+            log("[SMS] Ignored replay for locally deleted conversation address=\(address)")
+            return
+        }
+        if !assembly.replay { restoreSMSConversation(forAddress: address) }
+
         let previous = smsMessages.first(where: { $0.id == id })
         let incoming = direction.caseInsensitiveCompare("incoming") == .orderedSame || direction.caseInsensitiveCompare("in") == .orderedSame
         let message = CallshareSMSMessage(
@@ -609,6 +624,7 @@ final class AppModel: ObservableObject {
 
         let timestampMs = Int64(Date().timeIntervalSince1970 * 1_000.0)
         let messageID = UUID().uuidString.lowercased().replacingOccurrences(of: "-", with: "")
+        restoreSMSConversation(forAddress: normalizedAddress)
         let message = CallshareSMSMessage(
             id: messageID, address: normalizedAddress, body: text, direction: "outgoing",
             timestampMs: timestampMs, status: "sending", statusDetail: nil, isUnread: false
@@ -647,6 +663,36 @@ final class AppModel: ObservableObject {
             changed = true
         }
         if changed { persistSMSMessages() }
+    }
+
+    /// Removes a conversation from CALLSHARE's local iPhone history only.
+    /// It does not send a delete command to the J7 or erase the SMS from the SIM.
+    func deleteSMSConversation(forAddress address: String) {
+        let canonicalAddress = Self.canonicalSMSAddress(address)
+        guard !canonicalAddress.isEmpty else { return }
+
+        deletedSMSConversationAddresses.insert(canonicalAddress)
+        UserDefaults.standard.set(Array(deletedSMSConversationAddresses).sorted(), forKey: smsDeletedConversationsDefaultsKey)
+
+        let removedIDs = Set(smsMessages.filter { Self.canonicalSMSAddress($0.address) == canonicalAddress }.map(\.id))
+        smsMessages.removeAll { Self.canonicalSMSAddress($0.address) == canonicalAddress }
+        incomingSMSAssemblies = incomingSMSAssemblies.filter { Self.canonicalSMSAddress($0.value.address) != canonicalAddress }
+        if let pendingID = pendingSMSNavigationID, removedIDs.contains(pendingID) {
+            pendingSMSNavigationID = nil
+        }
+        persistSMSMessages()
+        log("[SMS] Deleted local conversation address=\(canonicalAddress), messages=\(removedIDs.count)")
+    }
+
+    private func restoreSMSConversation(forAddress address: String) {
+        let canonicalAddress = Self.canonicalSMSAddress(address)
+        guard !canonicalAddress.isEmpty, deletedSMSConversationAddresses.remove(canonicalAddress) != nil else { return }
+        UserDefaults.standard.set(Array(deletedSMSConversationAddresses).sorted(), forKey: smsDeletedConversationsDefaultsKey)
+    }
+
+    private static func loadDeletedSMSConversationAddresses(forKey key: String) -> Set<String> {
+        let stored = UserDefaults.standard.stringArray(forKey: key) ?? []
+        return Set(stored.map { canonicalSMSAddress($0) }.filter { !$0.isEmpty })
     }
 
     private static func canonicalSMSAddress(_ address: String) -> String {

@@ -260,6 +260,8 @@ struct EmptyStateView: View {
 struct SMSInboxView: View {
     @EnvironmentObject var app: AppModel
     @State private var path: [CallshareSMSRoute] = []
+    @State private var pendingDeleteAddress: String?
+    @State private var showDeleteConfirmation = false
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -306,13 +308,34 @@ struct SMSInboxView: View {
                             }
                             .padding(.vertical, 3)
                         }
+                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                            Button(role: .destructive) {
+                                pendingDeleteAddress = conversation.address
+                                showDeleteConfirmation = true
+                            } label: {
+                                Label("Delete", systemImage: "trash")
+                            }
+                        }
                     }
                     .listStyle(.plain)
                 }
             }
             .navigationTitle("Messages")
             .navigationDestination(for: CallshareSMSRoute.self) { route in
-                SMSConversationView(address: route.address, targetMessageID: route.targetMessageID)
+                SMSConversationView(address: route.address, targetMessageID: route.targetMessageID) {
+                    path.removeAll()
+                }
+            }
+            .confirmationDialog("Delete conversation?", isPresented: $showDeleteConfirmation, titleVisibility: .visible) {
+                Button("Delete Conversation", role: .destructive) {
+                    if let address = pendingDeleteAddress {
+                        app.deleteSMSConversation(forAddress: address)
+                    }
+                    pendingDeleteAddress = nil
+                }
+                Button("Cancel", role: .cancel) { pendingDeleteAddress = nil }
+            } message: {
+                Text("This removes the conversation from CALLSHARE on this iPhone only. It does not delete SMS messages from the J7 SIM.")
             }
             .onAppear { routePendingNotification() }
             .onChange(of: app.pendingSMSNavigationID) { _ in routePendingNotification() }
@@ -331,8 +354,10 @@ struct SMSConversationView: View {
     @EnvironmentObject var app: AppModel
     let address: String
     let targetMessageID: String?
+    let onDeleteConversation: () -> Void
     @State private var draft = ""
     @State private var showSendError = false
+    @State private var showDeleteConfirmation = false
     @State private var sendError = "The SMS could not be queued. Check BLE connection and the recipient number."
 
     private var messages: [CallshareSMSMessage] {
@@ -415,6 +440,25 @@ struct SMSConversationView: View {
         }
         .navigationTitle(address)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button(role: .destructive) {
+                    showDeleteConfirmation = true
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .accessibilityLabel("Delete conversation")
+            }
+        }
+        .confirmationDialog("Delete conversation?", isPresented: $showDeleteConfirmation, titleVisibility: .visible) {
+            Button("Delete Conversation", role: .destructive) {
+                app.deleteSMSConversation(forAddress: address)
+                onDeleteConversation()
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("This removes the conversation from CALLSHARE on this iPhone only. It does not delete SMS messages from the J7 SIM.")
+        }
         .alert("SMS Not Sent", isPresented: $showSendError) {
             Button("OK", role: .cancel) { }
         } message: {
