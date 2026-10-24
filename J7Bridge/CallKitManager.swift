@@ -8,9 +8,11 @@ final class CallKitManager: NSObject {
     private var currentUUID: UUID?
     private var answerAction: CXAnswerCallAction?
 
-    var onStart: ((String) -> Void)?
-    var onAnswer: (() -> Void)?
-    var onEnd: (() -> Void)?
+    // Call-control closures complete only after the BLE GATT write is acknowledged.
+    // This keeps CallKit's AirPods/HFP audio-session transition from racing signalling.
+    var onStart: ((String, @escaping (Bool) -> Void) -> Void)?
+    var onAnswer: ((@escaping (Bool) -> Void) -> Void)?
+    var onEnd: ((@escaping (Bool) -> Void) -> Void)?
     var onMute: ((Bool) -> Void)?
     var onDTMF: ((String) -> Void)?
     var onAudioActivated: (() -> Void)?
@@ -92,6 +94,11 @@ final class CallKitManager: NSObject {
         answerAction = nil
     }
 
+    func failAnswerIfNeeded() {
+        answerAction?.fail()
+        answerAction = nil
+    }
+
     func reportOutgoingConnecting() {
         guard let uuid = currentUUID else { return }
         provider.reportOutgoingCall(with: uuid, startedConnectingAt: Date())
@@ -127,28 +134,84 @@ extension CallKitManager: CXProviderDelegate {
 
     func provider(_ provider: CXProvider, perform action: CXStartCallAction) {
         currentUUID = action.callUUID
-        // Send GSM call signalling before negotiating the Bluetooth HFP audio route.
-        // The voice engine still waits for CallKit activation and J7 GSM readiness.
+        // Report the local intent immediately, but do not enable HFP audio until
+        // the MAKE_CALL write has been acknowledged by the J7 GATT server.
         reportOutgoingConnecting()
-        onStart?(action.handle.value)
-        onPrepareAudio?()
-        action.fulfill()
+        var finished = false
+        let timeout = DispatchWorkItem { [weak self] in
+            guard !finished else { return }
+            finished = true
+            self?.currentUUID = nil
+            action.fail()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 7.0, execute: timeout)
+        guard let onStart else {
+            timeout.cancel()
+            currentUUID = nil
+            action.fail()
+            return
+        }
+        onStart(action.handle.value) { [weak self] written in
+            guard let self, !finished else { return }
+            finished = true
+            timeout.cancel()
+            guard written else {
+                self.currentUUID = nil
+                action.fail()
+                return
+            }
+            self.onPrepareAudio?()
+            action.fulfill()
+        }
     }
 
     func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
         answerAction = action
-        // Deliver the GSM answer command before Bluetooth audio-route negotiation.
-        onAnswer?()
-        onPrepareAudio?()
+        // Keep the answer action pending until J7 confirms the answer event.
+        // Prepare AVAudioSession only after the ANSWER write reaches GATT.
+        guard let onAnswer else {
+            answerAction = nil
+            action.fail()
+            return
+        }
+        onAnswer { [weak self] written in
+            guard let self else { return }
+            guard written else {
+                self.answerAction?.fail()
+                self.answerAction = nil
+                return
+            }
+            if self.answerAction != nil { self.onPrepareAudio?() }
+        }
     }
 
     func provider(_ provider: CXProvider, perform action: CXEndCallAction) {
-        onEnd?()
-        action.fulfill()
-        currentUUID = nil
-        answerAction = nil
-        // onEnd (AppModel) closes audio before this action is fulfilled. Let the
-        // provider's didDeactivate notification represent the system transition.
+        // Let VOICE_CLOSE then HANGUP finish their GATT writes before CallKit
+        // deactivates the active HFP route. If BLE is temporarily unavailable,
+        // AppModel completes the local action and retains a retry intent.
+        guard let onEnd else {
+            action.fulfill()
+            currentUUID = nil
+            answerAction = nil
+            return
+        }
+        var finished = false
+        let timeout = DispatchWorkItem { [weak self] in
+            guard !finished else { return }
+            finished = true
+            action.fulfill()
+            self?.currentUUID = nil
+            self?.answerAction = nil
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6.0, execute: timeout)
+        onEnd { [weak self] _ in
+            guard let self, !finished else { return }
+            finished = true
+            timeout.cancel()
+            action.fulfill()
+            self.currentUUID = nil
+            self.answerAction = nil
+        }
     }
 
     func provider(_ provider: CXProvider, perform action: CXSetHeldCallAction) {

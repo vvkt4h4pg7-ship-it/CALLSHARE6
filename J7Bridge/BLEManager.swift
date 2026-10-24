@@ -31,11 +31,15 @@ final class BLEManager: NSObject, ObservableObject {
     // Serialize write-with-response control frames. In particular, VOICE_CLOSE
     // must complete before HANGUP is sent, so the call-end opcode is not raced
     // by the preceding audio-gate control write.
-    private var controlTXQueue: [(frame: Data, retries: Int)] = []
+    private var controlTXQueue: [(frame: Data, retries: Int, completion: ((Bool) -> Void)?)] = []
     private var controlWriteInFlight = false
-    private var inFlightControlWrite: (frame: Data, retries: Int)?
+    private var inFlightControlWrite: (frame: Data, retries: Int, completion: ((Bool) -> Void)?)?
+    private var controlWriteWatchdog: DispatchWorkItem?
+    private var controlTransportRecovering = false
 
-    var isReady: Bool { peripheral?.state == .connected && txChar != nil && rxNotifyEnabled }
+    var isReady: Bool {
+        !controlTransportRecovering && peripheral?.state == .connected && txChar != nil && rxNotifyEnabled
+    }
 
     var autoReconnect = true
     private var reconnectWorkItem: DispatchWorkItem?
@@ -74,7 +78,10 @@ final class BLEManager: NSObject, ObservableObject {
         onStatus?("Disconnected")
     }
 
-    func sendAnswer() { sendControl(Data([K7Protocol.cmdAnswer])) }
+    @discardableResult
+    func sendAnswer(completion: ((Bool) -> Void)? = nil) -> Bool {
+        sendControl(Data([K7Protocol.cmdAnswer]), completion: completion)
+    }
 
     /// Sends this iPhone's current Wi-Fi IPv4 to our companion Android app.
     /// Opcode 0xE7 is a CALLSHARE-owned extension; never send it to a stock K7 dongle.
@@ -105,7 +112,7 @@ final class BLEManager: NSObject, ObservableObject {
         var offset = 0
         while offset < frame.count {
             let end = min(frame.count, offset + maximumWrite)
-            controlTXQueue.append((frame: Data(frame[offset..<end]), retries: 0))
+            controlTXQueue.append((frame: Data(frame[offset..<end]), retries: 0, completion: nil))
             offset = end
         }
         flushControlTX()
@@ -118,30 +125,33 @@ final class BLEManager: NSObject, ObservableObject {
         log("[BLE] GATT CONTROL READY (TX + RX notify)")
         onReady?()
     }
-    func sendHangup() { sendControl(Data([K7Protocol.cmdHangup])) }
+    @discardableResult
+    func sendHangup(completion: ((Bool) -> Void)? = nil) -> Bool {
+        sendControl(Data([K7Protocol.cmdHangup]), completion: completion)
+    }
 
     func sendVoiceOpen() {
         sendControl(Data([K7Protocol.evtVoiceOpen]))
         log("[VOICE] OPEN requested")
     }
 
-    func sendVoiceClose() {
+    @discardableResult
+    func sendVoiceClose(completion: ((Bool) -> Void)? = nil) -> Bool {
         audioTXQueue.removeAll(keepingCapacity: true)
-        sendControl(Data([K7Protocol.evtVoiceClose]))
+        let queued = sendControl(Data([K7Protocol.evtVoiceClose]), completion: completion)
         log("[VOICE] CLOSE requested; audio queue cleared")
+        return queued
     }
 
     @discardableResult
-    func sendMakeCall(number: String, simId: UInt8) -> Bool {
-        // CallKit may begin the UI while CoreBluetooth is restoring the GATT link.
-        // The caller can hold this specific dial request and retry it from onReady.
+    func sendMakeCall(number: String, simId: UInt8, completion: ((Bool) -> Void)? = nil) -> Bool {
+        // Do not let CallKit's HFP route activation race ahead of the GATT write ACK.
         guard isReady, let connectedPeripheral = peripheral,
               connectedPeripheral.state == .connected, txChar != nil else {
             log("[BLE] MAKE_CALL deferred: GATT control channel is not ready")
             return false
         }
-        sendControl(K7Protocol.makeCallPayload(number: number, simId: simId))
-        return true
+        return sendControl(K7Protocol.makeCallPayload(number: number, simId: simId), completion: completion)
     }
 
     func sendDTMF(_ value: UInt8) {
@@ -192,10 +202,16 @@ final class BLEManager: NSObject, ObservableObject {
         flushAudioTX()
     }
 
-    private func sendControl(_ payload: Data) {
-        guard peripheral != nil, txChar != nil else { return }
-        controlTXQueue.append((frame: K7Protocol.wrapControl(payload), retries: 0))
+    @discardableResult
+    private func sendControl(_ payload: Data, completion: ((Bool) -> Void)? = nil) -> Bool {
+        guard !controlTransportRecovering,
+              let p = peripheral, p.state == .connected,
+              txChar != nil else {
+            return false
+        }
+        controlTXQueue.append((frame: K7Protocol.wrapControl(payload), retries: 0, completion: completion))
         flushControlTX()
+        return true
     }
 
     private func flushControlTX() {
@@ -210,11 +226,38 @@ final class BLEManager: NSObject, ObservableObject {
             controlWriteInFlight = true
             inFlightControlWrite = item
             p.writeValue(item.frame, for: tx, type: .withResponse)
+            armControlWriteWatchdog(for: p)
         } else if tx.properties.contains(.writeWithoutResponse) {
             // Keep compatibility with peers that expose only no-response writes.
             p.writeValue(item.frame, for: tx, type: .withoutResponse)
+            item.completion?(true)
+            DispatchQueue.main.async { [weak self] in self?.flushControlTX() }
+        } else {
+            item.completion?(false)
             DispatchQueue.main.async { [weak self] in self?.flushControlTX() }
         }
+    }
+
+    private func armControlWriteWatchdog(for peripheral: CBPeripheral) {
+        controlWriteWatchdog?.cancel()
+        let watchdog = DispatchWorkItem { [weak self, weak peripheral] in
+            guard let self, self.controlWriteInFlight else { return }
+            let stalledWrite = self.inFlightControlWrite
+            self.controlWriteInFlight = false
+            self.inFlightControlWrite = nil
+            self.controlWriteWatchdog = nil
+            self.controlTransportRecovering = true
+            self.log("[BLE] CONTROL WRITE ACK TIMEOUT; reconnecting GATT to recover stalled call-control queue")
+            if let peripheral, peripheral.state == .connected {
+                self.central.cancelPeripheralConnection(peripheral)
+            } else {
+                self.resetTransportState()
+                self.scheduleReconnect()
+            }
+            stalledWrite?.completion?(false)
+        }
+        controlWriteWatchdog = watchdog
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: watchdog)
     }
 
     private func flushAudioTX() {
@@ -251,6 +294,12 @@ final class BLEManager: NSObject, ObservableObject {
     }
 
     private func resetTransportState() {
+        var failedCompletions = controlTXQueue.compactMap { $0.completion }
+        if let completion = inFlightControlWrite?.completion {
+            failedCompletions.append(completion)
+        }
+        controlWriteWatchdog?.cancel()
+        controlWriteWatchdog = nil
         peripheral = nil
         rxChar = nil
         flowChar = nil
@@ -263,11 +312,13 @@ final class BLEManager: NSObject, ObservableObject {
         controlTXQueue.removeAll(keepingCapacity: true)
         controlWriteInFlight = false
         inFlightControlWrite = nil
+        controlTransportRecovering = false
         audioRXCount = 0
         rxValueCount = 0
         audioTXCount = 0
         audioTXBackpressureEvents = 0
         audioTXQueueDrops = 0
+        failedCompletions.forEach { $0(false) }
     }
 
     private func scheduleReconnect() {
@@ -398,15 +449,21 @@ extension BLEManager: CBPeripheralDelegate {
     }
 
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
-        guard characteristic.uuid == K7Protocol.tx, controlWriteInFlight else { return }
+        guard characteristic.uuid == K7Protocol.tx,
+              self.peripheral?.identifier == peripheral.identifier,
+              controlWriteInFlight else { return }
 
+        controlWriteWatchdog?.cancel()
+        controlWriteWatchdog = nil
         let completed = inFlightControlWrite
         controlWriteInFlight = false
         inFlightControlWrite = nil
 
         if error != nil, let completed, completed.retries < 1, peripheral.state == .connected {
             // One bounded retry for transient GATT write failures; no unbounded loop.
-            controlTXQueue.insert((frame: completed.frame, retries: completed.retries + 1), at: 0)
+            controlTXQueue.insert((frame: completed.frame, retries: completed.retries + 1, completion: completed.completion), at: 0)
+        } else {
+            completed?.completion?(error == nil)
         }
         flushControlTX()
     }

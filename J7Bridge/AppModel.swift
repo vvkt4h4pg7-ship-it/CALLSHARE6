@@ -120,7 +120,21 @@ final class AppModel: ObservableObject {
     private let networkQueue = DispatchQueue(label: "com.callshare.hybrid.network-monitor")
     private var lastAnnouncedIPv4: String?
     private var pendingOutgoingCall: (number: String, simId: UInt8)?
+    private var pendingOutgoingCallCompletion: ((Bool) -> Void)?
     private var pendingOutgoingCallTimeout: DispatchWorkItem?
+    private var pendingAnswerCommand = false
+    private var pendingAnswerAwaitingGSMOffhook = false
+    private var pendingAnswerCompletion: ((Bool) -> Void)?
+    private var pendingAnswerTimeout: DispatchWorkItem?
+    private var pendingAnswerRetryWorkItem: DispatchWorkItem?
+    private var pendingAnswerWriteInFlight = false
+    private var pendingAnswerAttempts = 0
+    private var pendingHangupCommand = false
+    private var pendingVoiceCloseForHangup = false
+    private var pendingHangupWriteInFlight = false
+    private var pendingEndCompletion: ((Bool) -> Void)?
+    private var pendingHangupRetryCount = 0
+    private var pendingHangupRetryWorkItem: DispatchWorkItem?
     private var didStart = false
 
     init() {
@@ -164,7 +178,10 @@ final class AppModel: ObservableObject {
         ble.onReady = { [weak self] in
             guard let self else { return }
             self.announceCurrentIPv4ToJ7(force: true)
-            self.flushPendingOutgoingCallIfReady()
+            self.flushPendingCallControlsIfReady()
+            if !self.pendingHangupCommand {
+                self.flushPendingOutgoingCallIfReady()
+            }
         }
 
         wifi.onJ7HostDiscovered = { [weak self] host in
@@ -178,12 +195,18 @@ final class AppModel: ObservableObject {
         wifi.onAudioPCM = { [weak self] pcm, rate, channels, frames in
             self?.wifiVoice.receivePCM(pcm, sampleRate: rate, channels: channels, frames: frames)
         }
-        callKit.onStart = { [weak self] number in self?.beginOutgoing(number) }
-        callKit.onAnswer = { [weak self] in
-            guard let self else { return }
-            self.ble.sendAnswer()
+        callKit.onStart = { [weak self] number, completion in
+            guard let self else { completion(false); return }
+            self.beginOutgoing(number, completion: completion)
         }
-        callKit.onEnd = { [weak self] in self?.endFromCallKit() }
+        callKit.onAnswer = { [weak self] completion in
+            guard let self else { completion(false); return }
+            self.requestAnswerFromCallKit(completion: completion)
+        }
+        callKit.onEnd = { [weak self] completion in
+            guard let self else { completion(false); return }
+            self.endFromCallKit(completion: completion)
+        }
         callKit.onMute = { [weak self] muted in
             self?.isMuted = muted
             self?.wifiVoice.setMuted(muted)
@@ -223,6 +246,10 @@ final class AppModel: ObservableObject {
     func answerTest() { ble.sendAnswer() }
 
     func makeCall() {
+        guard !pendingHangupCommand, (callStatus == "IDLE" || callStatus == "ENDED") else {
+            log("[CALL] New outgoing call blocked until previous J7 hangup is confirmed")
+            return
+        }
         let cleaned = dialString.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty else { return }
         beginCall(number: cleaned, direction: .outgoing, name: contacts.resolveName(for: cleaned))
@@ -232,8 +259,8 @@ final class AppModel: ObservableObject {
     // Start a real CALLSHARE GSM call from a selected contact or a recent call.
     // Keep this on the existing CallKit -> BLE MAKE_CALL path used by the keypad.
     func makeCall(to rawNumber: String) {
-        guard callStatus == "IDLE" || callStatus == "ENDED" else {
-            log("[CALL] Ignored selected-number call while status=\(callStatus)")
+        guard (callStatus == "IDLE" || callStatus == "ENDED"), !pendingHangupCommand else {
+            log("[CALL] Ignored selected-number call while status=\(callStatus) hangupPending=\(pendingHangupCommand)")
             return
         }
 
@@ -297,13 +324,20 @@ final class AppModel: ObservableObject {
         case K7Protocol.evtReceiveCall:
             handleIncoming(payload)
         case K7Protocol.evtAnswer:
-            callStatus = "ACTIVE"
-            if callConnectedAt == nil { callConnectedAt = Date() }
-            log("[CALL] BLE ANSWER EVENT / ACTIVE; waiting for physical GSM OFFHOOK before opening audio")
-            if currentDirection == .outgoing { callKit.reportOutgoingConnected() }
-            callKit.fulfillAnswerIfNeeded()
-            beginCallIfNeeded(direction: currentDirection ?? .incoming)
-            requestVoiceOpenIfReady()
+            // Android emits EVT_ANSWER after receiving the command, even when
+            // TelecomManager.acceptRingingCall() fails. Treat this as a command
+            // acknowledgement only; physical GSM OFFHOOK is the success signal.
+            guard pendingAnswerCommand || pendingAnswerAwaitingGSMOffhook else {
+                log("[CALL] Ignored unsolicited/stale BLE ANSWER acknowledgement")
+                break
+            }
+            pendingAnswerCommand = false
+            pendingAnswerAwaitingGSMOffhook = true
+            pendingAnswerWriteInFlight = false
+            pendingAnswerRetryWorkItem?.cancel()
+            pendingAnswerRetryWorkItem = nil
+            pendingAnswerAttempts = 0
+            log("[CALL] J7 acknowledged ANSWER command; waiting for physical GSM OFFHOOK before fulfilling CallKit")
         case K7Protocol.evtReceiveCallEnd:
             handleRemoteEnd()
         case K7Protocol.evtVoiceOpen:
@@ -332,6 +366,28 @@ final class AppModel: ObservableObject {
             log("[K7] IMEI \(imei)")
         case K7Protocol.evtCallshareGSMOffhook:
             gsmCallReady = true
+            if currentDirection == .incoming,
+               callStatus == "RINGING",
+               pendingAnswerCommand || pendingAnswerAwaitingGSMOffhook || pendingAnswerCompletion != nil {
+                // Only physical OFFHOOK proves that the cellular call really
+                // answered. Prepare the audio route, then fulfill CallKit.
+                pendingAnswerCommand = false
+                pendingAnswerAwaitingGSMOffhook = false
+                pendingAnswerWriteInFlight = false
+                pendingAnswerTimeout?.cancel()
+                pendingAnswerTimeout = nil
+                pendingAnswerRetryWorkItem?.cancel()
+                pendingAnswerRetryWorkItem = nil
+                pendingAnswerAttempts = 0
+                callStatus = "ACTIVE"
+                if callConnectedAt == nil { callConnectedAt = Date() }
+                beginCallIfNeeded(direction: .incoming)
+                let answerCompletion = pendingAnswerCompletion
+                pendingAnswerCompletion = nil
+                answerCompletion?(true)
+                callKit.fulfillAnswerIfNeeded()
+                log("[CALL] Incoming answer confirmed by physical GSM OFFHOOK")
+            }
             log("[HYBRID] J7 GSM OFFHOOK event received; CallKit=\(callAudioActive ? "active" : "not active")")
             requestVoiceOpenIfReady()
         case K7Protocol.evtCallshareCallActive:
@@ -376,6 +432,15 @@ final class AppModel: ObservableObject {
         remoteVoiceOpen = false
         gsmCallReady = false
         voiceOpenCommandSent = false
+        pendingAnswerCommand = false
+        pendingAnswerAwaitingGSMOffhook = false
+        pendingAnswerWriteInFlight = false
+        pendingAnswerRetryWorkItem?.cancel()
+        pendingAnswerRetryWorkItem = nil
+        pendingAnswerTimeout?.cancel()
+        pendingAnswerTimeout = nil
+        pendingAnswerCompletion = nil
+        pendingAnswerAttempts = 0
         callStatus = "RINGING"
         log("[CALL] INCOMING over BLE \(name.map { "\($0) / " } ?? "")\(incomingNumber)")
         // Critical: report to CallKit immediately; never wait for UDP/IP/audio readiness.
@@ -383,7 +448,7 @@ final class AppModel: ObservableObject {
         announceCurrentIPv4ToJ7(force: true)
     }
 
-    private func beginOutgoing(_ outgoingNumber: String) {
+    private func beginOutgoing(_ outgoingNumber: String, completion: @escaping (Bool) -> Void) {
         number = outgoingNumber
         callerName = contacts.resolveName(for: outgoingNumber) ?? ""
         currentContactName = callerName.isEmpty ? nil : callerName
@@ -392,43 +457,44 @@ final class AppModel: ObservableObject {
         callStatus = "DIALING"
 
         let selectedSIM = UInt8(simSlot)
-        if ble.sendMakeCall(number: outgoingNumber, simId: selectedSIM) {
+        let queued = ble.sendMakeCall(number: outgoingNumber, simId: selectedSIM) { [weak self] written in
+            guard let self else { completion(false); return }
+            if written {
+                self.clearPendingOutgoingCall()
+                self.log("[CALL] MAKE_CALL GATT write acknowledged; now allowing CallKit audio activation")
+                completion(true)
+            } else {
+                self.failOutgoingStart()
+                completion(false)
+            }
+        }
+        if queued {
             clearPendingOutgoingCall()
             log("[CALL] OUTGOING MAKE_CALL queued to GATT; SIM slot=\(simSlot)")
         } else {
-            queuePendingOutgoingCall(number: outgoingNumber, simId: selectedSIM)
-            log("[CALL] MAKE_CALL waiting for BLE GATT to become ready")
+            queuePendingOutgoingCall(number: outgoingNumber, simId: selectedSIM, completion: completion)
+            log("[CALL] MAKE_CALL waiting for BLE GATT readiness")
         }
     }
 
-    private func queuePendingOutgoingCall(number: String, simId: UInt8) {
+    private func queuePendingOutgoingCall(number: String, simId: UInt8, completion: @escaping (Bool) -> Void) {
         clearPendingOutgoingCall()
         pendingOutgoingCall = (number: number, simId: simId)
+        pendingOutgoingCallCompletion = completion
         let timeout = DispatchWorkItem { [weak self] in
             guard let self,
                   let pending = self.pendingOutgoingCall,
                   pending.number == number,
                   self.callStatus == "DIALING",
                   self.currentDirection == .outgoing else { return }
-            self.pendingOutgoingCall = nil
-            self.pendingOutgoingCallTimeout = nil
-            self.callKit.reportRemoteEnd(reason: .failed)
-            self.callStatus = "ENDED"
-            self.callStartedAt = nil
-            self.callConnectedAt = nil
-            self.currentDirection = nil
-            self.currentContactName = nil
-            self.callAudioActive = false
-            self.remoteVoiceOpen = false
-            self.gsmCallReady = false
-            self.voiceOpenCommandSent = false
-            self.voiceStatus = "CLOSED"
-            self.wifi.setAudioReceiveEnabled(false)
-            self.wifiVoice.stop()
-            self.log("[CALL] Outgoing call failed: BLE GATT was not ready within 10 seconds")
+            let failedCompletion = self.pendingOutgoingCallCompletion
+            self.clearPendingOutgoingCall()
+            self.failOutgoingStart()
+            failedCompletion?(false)
+            self.log("[CALL] Outgoing call failed: BLE GATT was not ready within 5.5 seconds")
         }
         pendingOutgoingCallTimeout = timeout
-        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: timeout)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5.5, execute: timeout)
     }
 
     private func flushPendingOutgoingCallIfReady() {
@@ -439,15 +505,195 @@ final class AppModel: ObservableObject {
             clearPendingOutgoingCall()
             return
         }
-        guard ble.sendMakeCall(number: pending.number, simId: pending.simId) else { return }
+        let completion = pendingOutgoingCallCompletion ?? { _ in }
+        let queued = ble.sendMakeCall(number: pending.number, simId: pending.simId) { [weak self] written in
+            guard let self else { completion(false); return }
+            self.clearPendingOutgoingCall()
+            if written {
+                self.log("[CALL] Deferred MAKE_CALL GATT write acknowledged")
+                completion(true)
+            } else {
+                self.failOutgoingStart()
+                completion(false)
+            }
+        }
+        guard queued else { return }
         clearPendingOutgoingCall()
-        log("[CALL] Deferred MAKE_CALL sent after BLE GATT became ready")
+        log("[CALL] Deferred MAKE_CALL queued after BLE GATT became ready")
     }
 
     private func clearPendingOutgoingCall() {
         pendingOutgoingCall = nil
+        pendingOutgoingCallCompletion = nil
         pendingOutgoingCallTimeout?.cancel()
         pendingOutgoingCallTimeout = nil
+    }
+
+    private func failOutgoingStart() {
+        clearPendingOutgoingCall()
+        callStatus = "ENDED"
+        callStartedAt = nil
+        callConnectedAt = nil
+        currentDirection = nil
+        currentContactName = nil
+        callAudioActive = false
+        remoteVoiceOpen = false
+        gsmCallReady = false
+        voiceOpenCommandSent = false
+        pendingAnswerCommand = false
+        pendingAnswerAwaitingGSMOffhook = false
+        pendingAnswerRetryWorkItem?.cancel()
+        pendingAnswerRetryWorkItem = nil
+        pendingAnswerCompletion = nil
+        pendingAnswerTimeout?.cancel()
+        pendingAnswerTimeout = nil
+        voiceStatus = "CLOSED"
+        wifi.setAudioReceiveEnabled(false)
+        wifiVoice.stop()
+    }
+
+    private func requestAnswerFromCallKit(completion: @escaping (Bool) -> Void) {
+        guard callStatus == "RINGING" else {
+            completion(false)
+            return
+        }
+        pendingAnswerCommand = true
+        pendingAnswerCompletion = completion
+        pendingAnswerAttempts = 0
+        pendingAnswerTimeout?.cancel()
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.pendingAnswerCommand || self.pendingAnswerAwaitingGSMOffhook else { return }
+            self.pendingAnswerCommand = false
+            self.pendingAnswerAwaitingGSMOffhook = false
+            self.pendingAnswerWriteInFlight = false
+            self.pendingAnswerRetryWorkItem?.cancel()
+            self.pendingAnswerRetryWorkItem = nil
+            let answerCompletion = self.pendingAnswerCompletion
+            self.pendingAnswerCompletion = nil
+            self.pendingAnswerTimeout = nil
+            answerCompletion?(false)
+            self.callKit.failAnswerIfNeeded()
+            self.log("[CALL] Answer failed: J7 did not confirm physical GSM OFFHOOK within 5.5 seconds")
+        }
+        pendingAnswerTimeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5.5, execute: timeout)
+        flushPendingCallControlsIfReady()
+    }
+
+    private func flushPendingCallControlsIfReady() {
+        guard ble.isReady else {
+            // A disconnected control channel must not silently discard Answer/Hangup.
+            // Keep the intent until the GATT-ready callback fires again.
+            completeEndAction(false)
+            return
+        }
+
+        if pendingHangupCommand {
+            guard !pendingHangupWriteInFlight else { return }
+            pendingHangupWriteInFlight = true
+            if pendingVoiceCloseForHangup {
+                let queued = ble.sendVoiceClose { [weak self] written in
+                    guard let self, self.pendingHangupCommand else { return }
+                    if written {
+                        self.pendingVoiceCloseForHangup = false
+                        self.sendPendingHangupWrite()
+                    } else {
+                        self.pendingHangupWriteInFlight = false
+                        self.completeEndAction(false)
+                        self.schedulePendingHangupRetry()
+                    }
+                }
+                if !queued {
+                    pendingHangupWriteInFlight = false
+                    completeEndAction(false)
+                }
+            } else {
+                sendPendingHangupWrite()
+            }
+            return
+        }
+
+        guard pendingAnswerCommand, !pendingAnswerWriteInFlight, callStatus == "RINGING" else { return }
+        pendingAnswerWriteInFlight = true
+        pendingAnswerAttempts += 1
+        let queued = ble.sendAnswer { [weak self] written in
+            guard let self else { return }
+            self.pendingAnswerWriteInFlight = false
+            guard self.pendingAnswerCommand else { return }
+            if written {
+                // A GATT write ACK is transport-level only. Android's EVT_ANSWER
+                // acknowledges the command; physical OFFHOOK fulfills the answer.
+                if self.pendingAnswerAttempts < 4 {
+                    self.schedulePendingAnswerRetry(after: 0.9)
+                }
+            } else if self.pendingAnswerAttempts < 4 {
+                self.schedulePendingAnswerRetry(after: 0.45)
+            } else {
+                self.pendingAnswerCommand = false
+                self.pendingAnswerAwaitingGSMOffhook = false
+                self.pendingAnswerRetryWorkItem?.cancel()
+                self.pendingAnswerRetryWorkItem = nil
+                self.pendingAnswerTimeout?.cancel()
+                self.pendingAnswerTimeout = nil
+                let completion = self.pendingAnswerCompletion
+                self.pendingAnswerCompletion = nil
+                completion?(false)
+                self.callKit.failAnswerIfNeeded()
+            }
+        }
+        if !queued { pendingAnswerWriteInFlight = false }
+    }
+
+    private func schedulePendingAnswerRetry(after delay: TimeInterval) {
+        pendingAnswerRetryWorkItem?.cancel()
+        let retry = DispatchWorkItem { [weak self] in
+            guard let self, self.pendingAnswerCommand, self.callStatus == "RINGING" else { return }
+            self.pendingAnswerRetryWorkItem = nil
+            self.flushPendingCallControlsIfReady()
+        }
+        pendingAnswerRetryWorkItem = retry
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: retry)
+    }
+
+    private func sendPendingHangupWrite() {
+        guard pendingHangupCommand, pendingHangupWriteInFlight else { return }
+        let queued = ble.sendHangup { [weak self] written in
+            guard let self else { return }
+            self.pendingHangupWriteInFlight = false
+            guard self.pendingHangupCommand else { return }
+            if written {
+                self.completeEndAction(true)
+                self.schedulePendingHangupRetry()
+            } else {
+                self.completeEndAction(false)
+                self.schedulePendingHangupRetry()
+            }
+        }
+        if !queued {
+            pendingHangupWriteInFlight = false
+            completeEndAction(false)
+        }
+    }
+
+    private func completeEndAction(_ success: Bool) {
+        guard let completion = pendingEndCompletion else { return }
+        pendingEndCompletion = nil
+        completion(success)
+    }
+
+    private func schedulePendingHangupRetry() {
+        pendingHangupRetryWorkItem?.cancel()
+        guard pendingHangupCommand, pendingHangupRetryCount < 2 else { return }
+        let retry = DispatchWorkItem { [weak self] in
+            guard let self, self.pendingHangupCommand, self.ble.isReady else { return }
+            self.pendingHangupRetryCount += 1
+            self.pendingHangupWriteInFlight = false
+            self.pendingVoiceCloseForHangup = false
+            self.flushPendingCallControlsIfReady()
+        }
+        pendingHangupRetryWorkItem = retry
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: retry)
     }
 
     private func beginCall(number: String, direction: CallDirection, name: String?) {
@@ -503,10 +749,32 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func endFromCallKit() {
+    private func endFromCallKit(completion: @escaping (Bool) -> Void) {
+        let pendingStartCompletion = pendingOutgoingCallCompletion
         clearPendingOutgoingCall()
-        ble.sendVoiceClose()
-        ble.sendHangup()
+        pendingStartCompletion?(false)
+
+        pendingAnswerCommand = false
+        pendingAnswerAwaitingGSMOffhook = false
+        pendingAnswerWriteInFlight = false
+        pendingAnswerRetryWorkItem?.cancel()
+        pendingAnswerRetryWorkItem = nil
+        pendingAnswerTimeout?.cancel()
+        pendingAnswerTimeout = nil
+        pendingAnswerAttempts = 0
+        pendingAnswerCompletion?(false)
+        pendingAnswerCompletion = nil
+
+        pendingHangupCommand = true
+        pendingVoiceCloseForHangup = true
+        pendingHangupWriteInFlight = false
+        pendingHangupRetryCount = 0
+        pendingEndCompletion = completion
+        pendingHangupRetryWorkItem?.cancel()
+        pendingHangupRetryWorkItem = nil
+
+        // Keep CallKit's current call registered until its CXEndCallAction is
+        // fulfilled. The BLE write must finish before CallKit deactivates HFP.
         callAudioActive = false
         wifi.setAudioReceiveEnabled(false)
         wifiVoice.stop()
@@ -516,11 +784,30 @@ final class AppModel: ObservableObject {
         gsmCallReady = false
         finishHistory(direction: currentDirection ?? .outgoing)
         callStatus = "ENDED"
-        callKit.clearCurrentCall()
+        flushPendingCallControlsIfReady()
     }
 
     private func handleRemoteEnd() {
+        let pendingStartCompletion = pendingOutgoingCallCompletion
         clearPendingOutgoingCall()
+        pendingStartCompletion?(false)
+        pendingHangupCommand = false
+        pendingVoiceCloseForHangup = false
+        pendingHangupWriteInFlight = false
+        pendingHangupRetryWorkItem?.cancel()
+        pendingHangupRetryWorkItem = nil
+        completeEndAction(true)
+        pendingAnswerCommand = false
+        pendingAnswerAwaitingGSMOffhook = false
+        pendingAnswerWriteInFlight = false
+        pendingAnswerRetryWorkItem?.cancel()
+        pendingAnswerRetryWorkItem = nil
+        pendingAnswerTimeout?.cancel()
+        pendingAnswerTimeout = nil
+        pendingAnswerAttempts = 0
+        pendingAnswerCompletion?(false)
+        pendingAnswerCompletion = nil
+
         // The local CallKit end action already finalized the call. Ignore its later
         // GSM IDLE echo to avoid duplicate call-history entries.
         if callStatus == "ENDED" && callStartedAt == nil { return }
