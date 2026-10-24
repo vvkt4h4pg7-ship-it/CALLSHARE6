@@ -135,8 +135,10 @@ final class WiFiVoiceEngine: NSObject {
             queue: nil
         ) { [weak self] _ in
             guard let self else { return }
-            let hfpRouteActive = self.routeUsesBluetoothHFP(self.audioSession.currentRoute)
-            self.scheduleEngineRecovery(reason: "engine-configuration-change", delay: 0.45, force: hfpRouteActive)
+            // The route-change observer already handles forced HFP recovery. An engine
+            // configuration notification can be a consequence of that recovery; do not
+            // force another rebuild from it while a call is actively playing.
+            self.scheduleEngineRecovery(reason: "engine-configuration-change", delay: 0.45, force: false)
         }
 
         interruptionObserver = center.addObserver(
