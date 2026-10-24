@@ -2,43 +2,47 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleExecutable</key>
-    <string>J7Bridge</string>
-    <key>CFBundleDisplayName</key>
-    <string>CALLSHARE</string>
-    <key>CFBundleIdentifier</key>
-    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
-    <key>CFBundleName</key>
-    <string>CALLSHARE</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>LSRequiresIPhoneOS</key>
-    <true/>
-    <key>NSLocalNetworkUsageDescription</key>
-    <string>CALLSHARE uses the local Wi-Fi network to exchange GSM call signaling and audio with the J7 hotspot.</string>
-    <key>NSBluetoothAlwaysUsageDescription</key>
-    <string>CALLSHARE uses Bluetooth Low Energy to communicate with the IKOS K7 gateway.</string>
-    <key>NSMicrophoneUsageDescription</key>
-    <string>CALLSHARE uses the microphone only during an active GSM call.</string>
-    <key>NSContactsUsageDescription</key>
-    <string>CALLSHARE uses Contacts to display caller names and provide a dialable contact list.</string>
-    <key>UIBackgroundModes</key>
-    <array>
-        <string>bluetooth-central</string>
-        <string>audio</string>
-        <string>voip</string>
-    </array>
-    <key>UILaunchScreen</key>
-    <dict/>
-    <key>CFBundleIconName</key>
-    <string>AppIcon</string>
-    <key>CFBundleIcons</key>
-    <dict>
-        <key>CFBundlePrimaryIcon</key>
-        <dict>
-            <key>CFBundleIconName</key>
-            <string>AppIcon</string>
-        </dict>
-    </dict>
+	<key>CFBundleExecutable</key>
+	<string>J7Bridge</string>
+	<key>CFBundleDisplayName</key>
+	<string>CALLSHARE</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleName</key>
+	<string>CALLSHARE</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>CALLSHARE uses the local Wi-Fi network to exchange GSM call signaling and audio with the J7 hotspot.</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>CALLSHARE uses Bluetooth Low Energy to communicate with the IKOS K7 gateway.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>CALLSHARE uses the microphone only during an active GSM call.</string>
+	<key>NSContactsUsageDescription</key>
+	<string>CALLSHARE uses Contacts to display caller names and provide a dialable contact list.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>bluetooth-central</string>
+		<string>audio</string>
+		<string>voip</string>
+	</array>
+	<key>UILaunchScreen</key>
+	<dict/>
+	<key>CFBundleIconName</key>
+	<string>AppIcon</string>
+	<key>CFBundleIcons</key>
+	<dict>
+		<key>CFBundlePrimaryIcon</key>
+		<dict>
+			<key>CFBundleIconName</key>
+			<string>AppIcon</string>
+			<key>CFBundleIconFiles</key>
+			<array>
+				<string>AppIcon</string>
+			</array>
+		</dict>
+	</dict>
 </dict>
 </plist>
