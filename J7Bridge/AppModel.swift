@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import CallKit
 import Network
 import Darwin
 
@@ -118,6 +119,8 @@ final class AppModel: ObservableObject {
     private var networkMonitor: NWPathMonitor?
     private let networkQueue = DispatchQueue(label: "com.callshare.hybrid.network-monitor")
     private var lastAnnouncedIPv4: String?
+    private var pendingOutgoingCall: (number: String, simId: UInt8)?
+    private var pendingOutgoingCallTimeout: DispatchWorkItem?
     private var didStart = false
 
     init() {
@@ -161,6 +164,7 @@ final class AppModel: ObservableObject {
         ble.onReady = { [weak self] in
             guard let self else { return }
             self.announceCurrentIPv4ToJ7(force: true)
+            self.flushPendingOutgoingCallIfReady()
         }
 
         wifi.onJ7HostDiscovered = { [weak self] host in
@@ -385,9 +389,65 @@ final class AppModel: ObservableObject {
         currentContactName = callerName.isEmpty ? nil : callerName
         dialString = ""
         beginCall(number: outgoingNumber, direction: .outgoing, name: currentContactName)
-        ble.sendMakeCall(number: outgoingNumber, simId: UInt8(simSlot))
         callStatus = "DIALING"
-        log("[CALL] OUTGOING requested over BLE GATT; SIM slot=\(simSlot)")
+
+        let selectedSIM = UInt8(simSlot)
+        if ble.sendMakeCall(number: outgoingNumber, simId: selectedSIM) {
+            clearPendingOutgoingCall()
+            log("[CALL] OUTGOING MAKE_CALL queued to GATT; SIM slot=\(simSlot)")
+        } else {
+            queuePendingOutgoingCall(number: outgoingNumber, simId: selectedSIM)
+            log("[CALL] MAKE_CALL waiting for BLE GATT to become ready")
+        }
+    }
+
+    private func queuePendingOutgoingCall(number: String, simId: UInt8) {
+        clearPendingOutgoingCall()
+        pendingOutgoingCall = (number: number, simId: simId)
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self,
+                  let pending = self.pendingOutgoingCall,
+                  pending.number == number,
+                  self.callStatus == "DIALING",
+                  self.currentDirection == .outgoing else { return }
+            self.pendingOutgoingCall = nil
+            self.pendingOutgoingCallTimeout = nil
+            self.callKit.reportRemoteEnd(reason: .failed)
+            self.callStatus = "ENDED"
+            self.callStartedAt = nil
+            self.callConnectedAt = nil
+            self.currentDirection = nil
+            self.currentContactName = nil
+            self.callAudioActive = false
+            self.remoteVoiceOpen = false
+            self.gsmCallReady = false
+            self.voiceOpenCommandSent = false
+            self.voiceStatus = "CLOSED"
+            self.wifi.setAudioReceiveEnabled(false)
+            self.wifiVoice.stop()
+            self.log("[CALL] Outgoing call failed: BLE GATT was not ready within 10 seconds")
+        }
+        pendingOutgoingCallTimeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: timeout)
+    }
+
+    private func flushPendingOutgoingCallIfReady() {
+        guard let pending = pendingOutgoingCall else { return }
+        guard callStatus == "DIALING",
+              currentDirection == .outgoing,
+              number == pending.number else {
+            clearPendingOutgoingCall()
+            return
+        }
+        guard ble.sendMakeCall(number: pending.number, simId: pending.simId) else { return }
+        clearPendingOutgoingCall()
+        log("[CALL] Deferred MAKE_CALL sent after BLE GATT became ready")
+    }
+
+    private func clearPendingOutgoingCall() {
+        pendingOutgoingCall = nil
+        pendingOutgoingCallTimeout?.cancel()
+        pendingOutgoingCallTimeout = nil
     }
 
     private func beginCall(number: String, direction: CallDirection, name: String?) {
@@ -444,6 +504,7 @@ final class AppModel: ObservableObject {
     }
 
     private func endFromCallKit() {
+        clearPendingOutgoingCall()
         ble.sendVoiceClose()
         ble.sendHangup()
         callAudioActive = false
@@ -459,6 +520,7 @@ final class AppModel: ObservableObject {
     }
 
     private func handleRemoteEnd() {
+        clearPendingOutgoingCall()
         // The local CallKit end action already finalized the call. Ignore its later
         // GSM IDLE echo to avoid duplicate call-history entries.
         if callStatus == "ENDED" && callStartedAt == nil { return }

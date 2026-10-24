@@ -131,8 +131,17 @@ final class BLEManager: NSObject, ObservableObject {
         log("[VOICE] CLOSE requested; audio queue cleared")
     }
 
-    func sendMakeCall(number: String, simId: UInt8) {
+    @discardableResult
+    func sendMakeCall(number: String, simId: UInt8) -> Bool {
+        // CallKit may begin the UI while CoreBluetooth is restoring the GATT link.
+        // The caller can hold this specific dial request and retry it from onReady.
+        guard isReady, let connectedPeripheral = peripheral,
+              connectedPeripheral.state == .connected, txChar != nil else {
+            log("[BLE] MAKE_CALL deferred: GATT control channel is not ready")
+            return false
+        }
         sendControl(K7Protocol.makeCallPayload(number: number, simId: simId))
+        return true
     }
 
     func sendDTMF(_ value: UInt8) {

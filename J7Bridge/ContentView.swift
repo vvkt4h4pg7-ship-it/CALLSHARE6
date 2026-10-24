@@ -64,7 +64,7 @@ struct PhoneView: View {
                 }
                 .padding()
             }
-            .navigationTitle("J7Bridge")
+            .navigationTitle("CALLSHARE")
         }
     }
 
@@ -141,7 +141,7 @@ struct RecentsView: View {
         NavigationStack {
             List {
                 if app.history.records.isEmpty {
-                    EmptyStateView(title: "No Calls", systemImage: "clock", message: "J7Bridge call history will appear here.")
+                    EmptyStateView(title: "No Calls", systemImage: "clock", message: "CALLSHARE call history will appear here.")
                 } else {
                     ForEach(app.history.records) { record in
                         Button {

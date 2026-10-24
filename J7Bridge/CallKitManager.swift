@@ -1,6 +1,7 @@
 import Foundation
 import CallKit
 import AVFoundation
+import UIKit
 
 final class CallKitManager: NSObject {
     private let provider: CXProvider
@@ -17,12 +18,13 @@ final class CallKitManager: NSObject {
     var onPrepareAudio: (() -> Void)?
 
     override init() {
-        let configuration = CXProviderConfiguration(localizedName: "J7Bridge")
+        let configuration = CXProviderConfiguration(localizedName: "CALLSHARE")
         configuration.supportsVideo = false
         configuration.maximumCallGroups = 1
         configuration.maximumCallsPerCallGroup = 1
         configuration.supportedHandleTypes = [.phoneNumber]
         configuration.includesCallsInRecents = true
+        configuration.iconTemplateImageData = UIImage(named: "CallKitTemplateIcon")?.pngData()
         provider = CXProvider(configuration: configuration)
         super.init()
         provider.setDelegate(self, queue: nil)
@@ -125,16 +127,19 @@ extension CallKitManager: CXProviderDelegate {
 
     func provider(_ provider: CXProvider, perform action: CXStartCallAction) {
         currentUUID = action.callUUID
-        onPrepareAudio?()
+        // Send GSM call signalling before negotiating the Bluetooth HFP audio route.
+        // The voice engine still waits for CallKit activation and J7 GSM readiness.
         reportOutgoingConnecting()
         onStart?(action.handle.value)
+        onPrepareAudio?()
         action.fulfill()
     }
 
     func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
         answerAction = action
-        onPrepareAudio?()
+        // Deliver the GSM answer command before Bluetooth audio-route negotiation.
         onAnswer?()
+        onPrepareAudio?()
     }
 
     func provider(_ provider: CXProvider, perform action: CXEndCallAction) {

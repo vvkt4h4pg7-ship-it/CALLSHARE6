@@ -85,6 +85,7 @@ final class WiFiVoiceEngine: NSObject {
     private var interruptionObserver: NSObjectProtocol?
     private var routeRecoveryWorkItem: DispatchWorkItem?
     private var pendingRecoveryReasons: [String] = []
+    private var pendingRecoveryForce = false
     private var lastEngineRecoveryUptime: TimeInterval = 0
     private var playbackDroppedFrames = 0
 
@@ -118,11 +119,14 @@ final class WiFiVoiceEngine: NSObject {
         ) { [weak self] notification in
             guard let self else { return }
             let reason = (notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt).map { String($0) } ?? "unknown"
-            self.report("[WIFI_AUDIO] ROUTE_CHANGE reason=\(reason) OUT=[\(self.currentOutputRouteDescription())] engineRunning=\(self.audioEngine.isRunning) playerPlaying=\(self.playerNode.isPlaying)")
-            // Do not tear down a healthy engine merely because the user tapped
-            // the CallKit speaker/receiver control. iOS owns this route change.
-            // Recovery is scheduled only as a health check after the route settles.
-            self.scheduleEngineRecovery(reason: "route-change-\(reason)", delay: 0.45)
+            let previousRoute = notification.userInfo?[AVAudioSessionRouteChangePreviousRouteKey] as? AVAudioSessionRouteDescription
+            let currentRoute = self.audioSession.currentRoute
+            let hfpRouteActive = self.routeUsesBluetoothHFP(currentRoute)
+                || (previousRoute.map { self.routeUsesBluetoothHFP($0) } ?? false)
+            self.report("[WIFI_AUDIO] ROUTE_CHANGE reason=\(reason) IN=[\(self.currentInputRouteDescription())] OUT=[\(self.currentOutputRouteDescription())] HFP=\(hfpRouteActive) engineRunning=\(self.audioEngine.isRunning) playerPlaying=\(self.playerNode.isPlaying)")
+            // A Bluetooth HFP route can change the input format while AVAudioEngine
+            // still reports running/playing. Rebuild the iOS graph after the route settles.
+            self.scheduleEngineRecovery(reason: "route-change-\(reason)", delay: 0.45, force: hfpRouteActive)
         }
 
         engineConfigurationObserver = center.addObserver(
@@ -130,7 +134,9 @@ final class WiFiVoiceEngine: NSObject {
             object: audioEngine,
             queue: nil
         ) { [weak self] _ in
-            self?.scheduleEngineRecovery(reason: "engine-configuration-change", delay: 0.45)
+            guard let self else { return }
+            let hfpRouteActive = self.routeUsesBluetoothHFP(self.audioSession.currentRoute)
+            self.scheduleEngineRecovery(reason: "engine-configuration-change", delay: 0.45, force: hfpRouteActive)
         }
 
         interruptionObserver = center.addObserver(
@@ -140,39 +146,43 @@ final class WiFiVoiceEngine: NSObject {
         ) { [weak self] notification in
             guard let rawType = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
                   let interruptionType = AVAudioSession.InterruptionType(rawValue: rawType),
-                  interruptionType == .ended else { return }
-            self?.scheduleEngineRecovery(reason: "session-interruption-ended", delay: 0.35)
+                  interruptionType == .ended,
+                  let self else { return }
+            let hfpRouteActive = self.routeUsesBluetoothHFP(self.audioSession.currentRoute)
+            self.scheduleEngineRecovery(reason: "session-interruption-ended", delay: 0.35, force: hfpRouteActive)
         }
     }
 
-    private func scheduleEngineRecovery(reason: String, delay: TimeInterval) {
+    private func scheduleEngineRecovery(reason: String, delay: TimeInterval, force: Bool = false) {
         playbackQueue.async { [weak self] in
             guard let self, self.runningSnapshot() else { return }
             self.pendingRecoveryReasons.append(reason)
+            self.pendingRecoveryForce = self.pendingRecoveryForce || force
             self.routeRecoveryWorkItem?.cancel()
-
             let workItem = DispatchWorkItem { [weak self] in
                 guard let self else { return }
                 let reasons = self.pendingRecoveryReasons
+                let forceRebuild = self.pendingRecoveryForce
                 self.pendingRecoveryReasons.removeAll(keepingCapacity: true)
+                self.pendingRecoveryForce = false
                 self.routeRecoveryWorkItem = nil
                 guard self.runningSnapshot() else { return }
-
-                // A route change is not itself a reason to stop/recreate the
-                // graph. Only recover if iOS actually stopped the engine/player.
+                // For normal receiver/speaker changes, leave a healthy graph alone.
+                // HFP route/format changes are different: rebuild even if the nodes
+                // still claim to be running, because the old microphone format may be stale.
                 let engineHealthy = self.audioEngine.isRunning && self.playerNode.isPlaying
-                guard !engineHealthy else {
+                guard forceRebuild || !engineHealthy else {
                     self.report("[WIFI_AUDIO] ROUTE_RECOVERY SKIP healthy engine=\(self.audioEngine.isRunning) player=\(self.playerNode.isPlaying) reason=\(reasons.joined(separator: ","))")
                     return
                 }
-
                 let now = ProcessInfo.processInfo.systemUptime
                 if self.lastEngineRecoveryUptime > 0 && now - self.lastEngineRecoveryUptime < 0.60 {
                     self.report("[WIFI_AUDIO] ROUTE_RECOVERY recent recovery; avoiding restart loop")
                     return
                 }
                 self.lastEngineRecoveryUptime = now
-                self.recoverAudioEngine(reason: reasons.joined(separator: ","))
+                let fullReason = reasons.joined(separator: ",") + (forceRebuild ? ",forced-HFP-route" : "")
+                self.recoverAudioEngine(reason: fullReason)
             }
             self.routeRecoveryWorkItem = workItem
             self.playbackQueue.asyncAfter(deadline: .now() + delay, execute: workItem)
@@ -205,8 +215,17 @@ final class WiFiVoiceEngine: NSObject {
         }
     }
 
+    private func currentInputRouteDescription() -> String {
+        audioSession.currentRoute.inputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ",")
+    }
+
     private func currentOutputRouteDescription() -> String {
         audioSession.currentRoute.outputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ",")
+    }
+
+    private func routeUsesBluetoothHFP(_ route: AVAudioSessionRouteDescription) -> Bool {
+        route.inputs.contains { $0.portType == .bluetoothHFP }
+            || route.outputs.contains { $0.portType == .bluetoothHFP }
     }
 
     // MARK: - Public API (kept compatible with AppModel.swift)
@@ -240,6 +259,8 @@ final class WiFiVoiceEngine: NSObject {
             routeRecoveryWorkItem?.cancel()
             routeRecoveryWorkItem = nil
             pendingRecoveryReasons.removeAll(keepingCapacity: true)
+            pendingRecoveryForce = false
+            lastEngineRecoveryUptime = 0
             guard wasRunning || audioEngine.isRunning || playerNode.isPlaying else {
                 // Invalidate delayed playback completions even for duplicate CallKit stop callbacks.
                 playbackEpoch &+= 1
